@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40" viewBox="0 0 80 40">
+  <!-- Хвост -> голова: перекрывающиеся сегменты создают заострённое тело. Голова смотрит вправо (rotation=0 = "вправо", как и у обычного червя). -->
+  <ellipse cx="8" cy="20" rx="6" ry="5" fill="#355418" />
+  <ellipse cx="21" cy="20" rx="8" ry="7" fill="#4c7a2a" />
+  <ellipse cx="21" cy="20" rx="8" ry="7" fill="none" stroke="#355418" stroke-width="1.5" />
+  <ellipse cx="37" cy="20" rx="9.5" ry="8.5" fill="#4c7a2a" />
+  <ellipse cx="37" cy="20" rx="9.5" ry="8.5" fill="none" stroke="#355418" stroke-width="1.5" />
+  <ellipse cx="54" cy="20" rx="11" ry="9.5" fill="#4c7a2a" />
+  <ellipse cx="54" cy="20" rx="11" ry="9.5" fill="none" stroke="#355418" stroke-width="1.5" />
+
+  <!-- Голова -->
+  <ellipse cx="66" cy="20" rx="12" ry="10.5" fill="#5c8f30" />
+  <ellipse cx="66" cy="20" rx="12" ry="10.5" fill="none" stroke="#355418" stroke-width="1.5" />
+
+  <!-- Шипы на спине -->
+  <polygon points="16,13 19,4 22,13" fill="#8a2e22" />
+  <polygon points="32,12 35,2 38,12" fill="#8a2e22" />
+  <polygon points="49,11 52,1 55,11" fill="#8a2e22" />
+
+  <!-- Глаза -->
+  <circle cx="62" cy="15" r="3.4" fill="#f4fff0" />
+  <circle cx="62" cy="15" r="1.6" fill="#151a10" />
+  <circle cx="62" cy="26" r="3.4" fill="#f4fff0" />
+  <circle cx="62" cy="26" r="1.6" fill="#151a10" />
+
+  <!-- Челюсти -->
+  <polygon points="76,17 80,14 78,19" fill="#e8e3c8" />
+  <polygon points="76,23 80,26 78,21" fill="#e8e3c8" />
+</svg>

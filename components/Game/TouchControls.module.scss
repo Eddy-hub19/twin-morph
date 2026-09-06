@@ -1,0 +1,99 @@
+.joystick {
+  display: none;
+  position: fixed;
+  right: max(16px, env(safe-area-inset-right));
+  bottom: max(48px, env(safe-area-inset-bottom));
+  z-index: 10;
+
+  // Тач-устройства (телефоны/планшеты) ИЛИ просто узкий экран — на всякий
+  // случай учитываем и то, и другое.
+  @media (pointer: coarse), (max-width: 820px) {
+    display: block;
+  }
+}
+
+.base {
+  position: relative;
+  width: 180px;
+  height: 180px;
+  border-radius: 50%;
+
+  background: rgba(20, 24, 28, 0.28);
+  border: 2px solid rgba(255, 255, 255, 0.55);
+  box-shadow: inset 0 0 24px rgba(0, 0, 0, 0.25);
+
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  touch-action: none;
+  user-select: none;
+}
+
+.stick {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 68px;
+  height: 68px;
+  margin: -34px 0 0 -34px;
+  border-radius: 50%;
+
+  background: rgba(255, 255, 255, 0.18);
+  border: 2px solid rgba(255, 255, 255, 0.8);
+
+  pointer-events: none;
+}
+
+.chevron {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  pointer-events: none;
+
+  &::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-top: 3px solid rgba(255, 255, 255, 0.75);
+    border-right: 3px solid rgba(255, 255, 255, 0.75);
+  }
+}
+
+.chevronUp {
+  top: 10px;
+  left: 50%;
+  margin-left: -6px;
+
+  &::before {
+    transform: rotate(-45deg);
+  }
+}
+
+.chevronRight {
+  top: 50%;
+  right: 10px;
+  margin-top: -6px;
+
+  &::before {
+    transform: rotate(45deg);
+  }
+}
+
+.chevronDown {
+  bottom: 10px;
+  left: 50%;
+  margin-left: -6px;
+
+  &::before {
+    transform: rotate(135deg);
+  }
+}
+
+.chevronLeft {
+  top: 50%;
+  left: 10px;
+  margin-top: -6px;
+
+  &::before {
+    transform: rotate(-135deg);
+  }
+}

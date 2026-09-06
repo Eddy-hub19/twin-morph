@@ -1,0 +1,5 @@
+{
+  "cols": 6,
+  "rows": 4,
+  "rowMap": ["walk", "attack", "front", "back"]
+}

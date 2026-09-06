@@ -6,12 +6,20 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "sprites": "node scripts/buildSprites.js",
+    "dev:server": "npm --prefix server run dev",
+    "server:install": "npm --prefix server install"
   },
   "dependencies": {
+    "@cambioreal/icons": "^0.3.0",
     "next": "16.2.10",
+    "pixi.js": "^8.19.0",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "sass": "^1.101.0",
+    "sharp": "^0.35.3",
+    "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
     "@types/node": "^20",
@@ -20,6 +28,7 @@
     "babel-plugin-react-compiler": "1.0.0",
     "eslint": "^9",
     "eslint-config-next": "16.2.10",
+    "free-tex-packer-core": "^0.3.8",
     "typescript": "^5"
   }
 }

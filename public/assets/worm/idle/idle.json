@@ -1,0 +1,94 @@
+{
+  "frames": {
+    "worm_idle_worm_001.png": {
+      "frame": {
+        "x": 0,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 41,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    "worm_idle_worm_002.png": {
+      "frame": {
+        "x": 41,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 41,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    "worm_idle_worm_003.png": {
+      "frame": {
+        "x": 82,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 41,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    }
+  },
+  "meta": {
+    "app": "http://github.com/odrick/free-tex-packer-core",
+    "version": "0.3.8",
+    "image": "idle.png",
+    "format": "RGBA8888",
+    "size": {
+      "w": 123,
+      "h": 21
+    },
+    "scale": 1
+  },
+  "animations": {
+    "idle": [
+      "worm_idle_worm_001.png",
+      "worm_idle_worm_002.png",
+      "worm_idle_worm_003.png"
+    ]
+  }
+}

@@ -20,6 +20,16 @@ body {
   overflow-x: hidden;
 }
 
+html,
+body {
+  /* Игра на весь экран — долгое касание не должно открывать системное меню
+     "Скопировать / Перевести / Поделиться" (iOS Safari) и не должно давать
+     выделять текст/картинки на странице. */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
 body {
   min-height: 100%;
   display: flex;

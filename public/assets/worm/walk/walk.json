@@ -1,0 +1,294 @@
+{
+  "frames": {
+    "worm_walk_worm_007.png": {
+      "frame": {
+        "x": 0,
+        "y": 0,
+        "w": 44,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 44,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 44,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    "worm_walk_worm_008.png": {
+      "frame": {
+        "x": 44,
+        "y": 0,
+        "w": 43,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 43,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 43,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    "worm_walk_worm_014.png": {
+      "frame": {
+        "x": 87,
+        "y": 0,
+        "w": 43,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 43,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 43,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    "worm_walk_worm_004.png": {
+      "frame": {
+        "x": 130,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 41,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    "worm_walk_worm_005.png": {
+      "frame": {
+        "x": 171,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 41,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    "worm_walk_worm_006.png": {
+      "frame": {
+        "x": 212,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 41,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    "worm_walk_worm_009.png": {
+      "frame": {
+        "x": 253,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 41,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    "worm_walk_worm_013.png": {
+      "frame": {
+        "x": 294,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 41,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 41,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    "worm_walk_worm_012.png": {
+      "frame": {
+        "x": 335,
+        "y": 0,
+        "w": 39,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 39,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 39,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    "worm_walk_worm_010.png": {
+      "frame": {
+        "x": 374,
+        "y": 0,
+        "w": 38,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 38,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 38,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    },
+    "worm_walk_worm_011.png": {
+      "frame": {
+        "x": 412,
+        "y": 0,
+        "w": 38,
+        "h": 21
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 38,
+        "h": 21
+      },
+      "sourceSize": {
+        "w": 38,
+        "h": 21
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      }
+    }
+  },
+  "meta": {
+    "app": "http://github.com/odrick/free-tex-packer-core",
+    "version": "0.3.8",
+    "image": "walk.png",
+    "format": "RGBA8888",
+    "size": {
+      "w": 450,
+      "h": 21
+    },
+    "scale": 1
+  },
+  "animations": {
+    "walk": [
+      "worm_walk_worm_004.png",
+      "worm_walk_worm_005.png",
+      "worm_walk_worm_006.png",
+      "worm_walk_worm_007.png",
+      "worm_walk_worm_008.png",
+      "worm_walk_worm_009.png",
+      "worm_walk_worm_010.png",
+      "worm_walk_worm_011.png",
+      "worm_walk_worm_012.png",
+      "worm_walk_worm_013.png",
+      "worm_walk_worm_014.png"
+    ]
+  }
+}
