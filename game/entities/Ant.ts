@@ -241,4 +241,26 @@ export class Ant extends Entity {
 
     this.updateLeaf(deltaTime)
   }
+
+  /**
+   * Ставит муравья в позицию, полученную по сети (напарник в co-op) —
+   * аналог Worm.setRemotePosition: своя физика (столкновения с лужами,
+   * сбор листьев) уже честно посчитана на ЕГО клиенте, нам остаётся только
+   * отрисовать результат — позицию по X и цикл ходьбы по факту смещения.
+   */
+  public setRemotePosition(x: number): void {
+    if (!this.sprite || this.isDead) return
+
+    const dx = x - this.container.x
+    const isMoving = Math.abs(dx) > 0.3
+
+    if (isMoving) {
+      this.sprite.scale.x = dx < 0 ? -Math.abs(this.sprite.scale.y) : Math.abs(this.sprite.scale.y)
+      if (!this.sprite.playing) this.sprite.play()
+    } else if (this.sprite.playing) {
+      this.sprite.gotoAndStop(0)
+    }
+
+    this.container.x = x
+  }
 }

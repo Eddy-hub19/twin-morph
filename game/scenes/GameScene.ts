@@ -14,6 +14,9 @@ import { LevelDoorMarker } from "../entities/LevelDoorMarker"
 import { Leaf } from "../entities/Leaf"
 import { Puddle } from "../entities/Puddle"
 import { Sky } from "../entities/Sky"
+import { GameNetworkStore } from "../network/GameNetworkStore"
+import type { InputManager } from "../input/InputManager"
+import type { PlayerForm, PlayerState } from "../../shared/game-protocol"
 import { Container, Sprite, Text, TextStyle, Texture } from "pixi.js"
 import {
   CELL_SIZE,
@@ -70,6 +73,27 @@ export class GameScene extends Scene {
 
   private activePlayer!: any
   private deathTimer = 0
+
+  // Co-op: напарник — точно такой же Worm/Ant, что и локальный игрок (не
+  // отдельный "призрак"-класс), просто его позицией управляет не InputManager,
+  // а сетевой снапшот (см. syncNetwork/GameNetworkStore.getRemotePlayerStates).
+  // В single player этот стор всегда в режиме "solo", и вся секция ниже —
+  // no-op (см. syncNetwork: ранний return, если mode !== "coop").
+  private readonly network = GameNetworkStore.getInstance()
+  private readonly remoteEntities = new Map<string, { entity: Worm | Ant; form: PlayerForm }>()
+  // "Пустой" InputManager для сущностей напарника — их update() мы вообще не
+  // вызываем (двигаем через setRemotePosition), но конструкторы Worm/Ant
+  // требуют объект с этим интерфейсом; настоящий InputManager вешал бы
+  // реальные обработчики window.addEventListener, что тут не нужно и вредно.
+  private readonly dummyInput = {
+    isDown: () => false,
+    isJustPressed: () => false,
+    getAnalogVector: () => null,
+    setAnalogVector: () => {},
+    clearAnalogVector: () => {},
+    setKeyState: () => {},
+    destroy: () => {},
+  } as unknown as InputManager
 
   private worldContainer = new Container()
 
@@ -826,11 +850,94 @@ export class GameScene extends Scene {
   private restartLevel(): void {
     this.worldContainer.removeChildren()
     this.entities = []
+    // Контейнеры напарника уже уничтожены строкой выше (removeChildren) —
+    // забываем и сами инстансы, иначе следующий syncNetwork() попытается
+    // двигать сущности, которых больше нет в мире, вместо того чтобы
+    // создать их заново.
+    this.remoteEntities.clear()
     this.deathTimer = 0
     this.onCreate()
   }
 
+  /**
+   * Co-op: отправляет позицию нашего игрока остальным и заводит/двигает/
+   * убирает сущности напарников — каждый напарник ровно тот же Worm/Ant,
+   * что и локальный игрок, просто ведомый сетевым снапшотом, а не вводом
+   * (см. GameSocket/GameNetworkStore и комментарий у remoteEntities выше).
+   * В single player — ранний return, ничего не делает.
+   */
+  private syncNetwork(): void {
+    if (this.network.getSnapshot().mode !== "coop") return
+
+    if (this.activePlayer) {
+      const form: PlayerForm = this.activePlayer instanceof Ant ? "ant" : "worm"
+      this.network.reportLocalPose(this.activePlayer.container.x, this.activePlayer.container.y, form)
+    }
+
+    const remoteStates = this.network.getRemotePlayerStates()
+    const seenPlayerIds = new Set<string>()
+
+    for (const state of remoteStates) {
+      seenPlayerIds.add(state.playerId)
+      this.upsertRemoteEntity(state)
+    }
+
+    for (const [playerId, remote] of this.remoteEntities) {
+      if (seenPlayerIds.has(playerId)) continue
+
+      this.worldContainer.removeChild(remote.entity.container)
+      this.entities = this.entities.filter((e) => e !== remote.entity)
+      this.remoteEntities.delete(playerId)
+    }
+  }
+
+  /** true, если это сущность напарника (см. remoteEntities) — такие исключаются
+   * из обычного per-entity update() цикла (см. вызов ниже в update()). */
+  private isRemoteEntity(entity: Entity): boolean {
+    for (const remote of this.remoteEntities.values()) {
+      if (remote.entity === entity) return true
+    }
+    return false
+  }
+
+  /** Создаёт (при первом появлении), пересоздаёт (при смене формы — прошёл
+   * метаморфозу у себя) и двигает сущность одного напарника. */
+  private upsertRemoteEntity(state: PlayerState): void {
+    let remote = this.remoteEntities.get(state.playerId)
+
+    if (!remote) {
+      const worm = new Worm(this.dummyInput)
+      worm.container.x = state.x
+      worm.container.y = state.y
+      worm.init()
+
+      remote = { entity: worm, form: "worm" }
+      this.remoteEntities.set(state.playerId, remote)
+      this.addEntity(worm)
+    }
+
+    if (remote.form !== state.form) {
+      // Напарник прошёл метаморфозу у себя — пересоздаём тем же классом,
+      // что и локальный игрок (Worm -> Ant), без кат-сцены с зумом: камера
+      // в этой сцене одна и следит только за нашим собственным игроком.
+      this.worldContainer.removeChild(remote.entity.container)
+      this.entities = this.entities.filter((e) => e !== remote!.entity)
+
+      const nextEntity: Worm | Ant = new Ant(this.dummyInput, state.x, state.y)
+      remote = { entity: nextEntity, form: state.form }
+      this.remoteEntities.set(state.playerId, remote)
+      this.addEntity(nextEntity)
+    }
+
+    if (remote.entity instanceof Ant) {
+      remote.entity.setRemotePosition(state.x)
+    } else {
+      remote.entity.setRemotePosition(state.x, state.y)
+    }
+  }
+
   public update(deltaTime: number): void {
+    this.syncNetwork()
     this.updateReveal(deltaTime)
     this.updateFog()
 
@@ -1070,13 +1177,18 @@ export class GameScene extends Scene {
       : stars
 
     this.entities.forEach((entity) => {
-      if (entity !== this.activePlayer && !(entity instanceof GuardWorm)) {
+      if (entity !== this.activePlayer && !(entity instanceof GuardWorm) && !this.isRemoteEntity(entity)) {
         // Передаём стены и звёзды всем сущностям — они не обязаны их
         // использовать (Wall/Star/Bubble/Nest их игнорируют), но вражеским
         // червякам это нужно: стены — чтобы не лезть сквозь непрокопанную
         // землю, звёзды — чтобы было что воровать (кроме уже сложенных у
         // домика — см. stealableStars выше). Стражей (GuardWorm) сюда не
         // пускаем — у них отдельный tick() ниже, реагирующий только на игрока.
+        // Напарника (remote Worm/Ant) — тоже: у него своя физика уже
+        // посчитана на ЕГО клиенте, обычный update() тут только сломает его
+        // (например, найдёт "стену" прямо под ним в точке (0,0) до первого
+        // сетевого снапшота и убьёт — двигаем его исключительно через
+        // setRemotePosition в syncNetwork).
         entity.update(deltaTime, walls, stealableStars)
       }
     })

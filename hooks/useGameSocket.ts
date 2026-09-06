@@ -12,7 +12,8 @@ export interface UseGameSocketResult {
   /** Свободных мест в комнате (для co-op-лобби: "ждём второго игрока…"). */
   isWaitingForSecondPlayer: boolean
   startSolo: (form?: PlayerForm) => void
-  startCoop: () => Promise<RoomInfo>
+  /** roomId — из ссылки-приглашения (?room=...), присоединиться именно к ней. */
+  startCoop: (roomId?: string) => Promise<RoomInfo>
   disconnect: () => void
   store: GameNetworkStore
 }
@@ -34,7 +35,7 @@ export function useGameSocket(): UseGameSocketResult {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 
   const startSolo = useCallback((form?: PlayerForm) => store.startSolo(form), [])
-  const startCoop = useCallback(() => store.startCoop(), [])
+  const startCoop = useCallback((roomId?: string) => store.startCoop(roomId), [])
   const disconnect = useCallback(() => store.disconnect(), [])
 
   const isWaitingForSecondPlayer =

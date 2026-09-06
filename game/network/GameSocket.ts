@@ -4,7 +4,7 @@ import type { ClientToServerEvents, ServerToClientEvents } from "@/shared/game-p
 const SESSION_STORAGE_KEY = "twin-morph.sessionId"
 
 /** Адрес NestJS co-op сервера — в single player эта переменная вообще не читается. */
-const SERVER_URL = process.env.NEXT_PUBLIC_GAME_SERVER_URL ?? "http://localhost:3001"
+const SERVER_URL = process.env.NEXT_PUBLIC_SOCKET_URL ?? "http://localhost:3001"
 
 export type TypedGameSocket = Socket<ServerToClientEvents, ClientToServerEvents>
 
@@ -52,7 +52,7 @@ export class GameSocket {
         reconnection: true,
         reconnectionDelay: 500,
         reconnectionDelayMax: 4000,
-        transports: ["websocket", "polling"],
+        transports: ["websocket"],
       })
     } else if (!this.socket.connected) {
       this.socket.connect()

@@ -183,6 +183,35 @@ export class Worm extends Entity {
     return this.animationState === "dead"
   }
 
+  /**
+   * Ставит червя в позицию, полученную по сети (напарник в co-op), — не
+   * копание/столкновения, вся физика уже честно посчитана на ЕГО клиенте
+   * (свои собственные, отдельно сгенерированные стены), нам остаётся только
+   * отрисовать результат: позицию + анимацию ходьбы по факту смещения между
+   * кадрами (в отличие от обычного update(), тут нет ни клавиатуры, ни
+   * джойстика — только "куда сместился с прошлого раза").
+   */
+  public setRemotePosition(x: number, y: number): void {
+    if (!this.sprite || this.animationState === "dead") return
+
+    const dx = x - this.container.x
+    const dy = y - this.container.y
+    const moving = Math.hypot(dx, dy) > 0.5
+
+    if (moving) {
+      this.container.rotation = Math.atan2(dy, dx)
+    }
+
+    const nextState: AnimationState = moving ? "walk" : "idle"
+    if (this.animationState !== nextState) {
+      this.animationState = nextState
+      this.applyAnimation(nextState)
+    }
+
+    this.container.x = x
+    this.container.y = y
+  }
+
   /** Убивает червя извне (например, столкновение со стражем) — тот же путь, что и смерть от камня. */
   public kill(): void {
     if (this.animationState === "dead") {

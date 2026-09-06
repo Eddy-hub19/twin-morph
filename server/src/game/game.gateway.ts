@@ -13,6 +13,7 @@ import type {
   JoinRoomPayload,
   LevelCompletePayload,
   PlayerInput,
+  PlayerPosePayload,
   PlayerTransformPayload,
 } from "../../../shared/game-protocol"
 import { RoomService } from "./room.service"
@@ -30,7 +31,7 @@ interface SocketSessionData {
 type GameSocket = Socket & { data: SocketSessionData }
 
 @WebSocketGateway({
-  cors: { origin: process.env.CLIENT_ORIGIN ?? "http://localhost:3000", credentials: true },
+  cors: { origin: process.env.FRONTEND_URL ?? "http://localhost:3000", credentials: true },
 })
 export class GameGateway implements OnGatewayInit, OnGatewayDisconnect {
   @WebSocketServer()
@@ -90,6 +91,18 @@ export class GameGateway implements OnGatewayInit, OnGatewayDisconnect {
     if (!playerId) return
 
     this.gameService.queueInput(playerId, input)
+  }
+
+  /** Реальный путь синхронизации в Twin Morph — см. комментарий в GameService:
+   * позиция уже честно посчитана клиентом (его собственным Worm/Ant с учётом
+   * стен), сервер только сохраняет и ретранслирует её остальным в комнате. */
+  @SubscribeMessage("playerPose")
+  public handlePlayerPose(@ConnectedSocket() client: GameSocket, @MessageBody() payload: PlayerPosePayload): void {
+    const roomId = client.data.roomId
+    const playerId = client.data.playerId
+    if (!roomId || !playerId) return
+
+    this.gameService.setPose(roomId, playerId, payload)
   }
 
   @SubscribeMessage("playerTransform")

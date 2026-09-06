@@ -98,6 +98,23 @@ export interface PlayerLeftPayload {
   playerId: string
 }
 
+/**
+ * Настоящая (уже посчитанная локально — с учётом стен/копания/травы) поза
+ * игрока. В этой игре нельзя честно пересчитать движение авторитетно на
+ * сервере — стены/уровень у каждого клиента свои процедурно сгенерированные,
+ * сервер их не знает. Поэтому сервер тут не "физический авторитет", а просто
+ * ретранслятор: держит последнюю присланную позу каждого игрока и рассылает
+ * её остальным в комнате (см. GameService.setPose). PlayerInput/seq выше
+ * оставлены как общая инфраструктура для generic-случая (если понадобится
+ * честная server-side физика в другом режиме), но именно эту (совместную)
+ * механику двигает playerPose.
+ */
+export interface PlayerPosePayload {
+  x: number
+  y: number
+  form: PlayerForm
+}
+
 // ---------------------------------------------------------------------------
 // Типизированные карты событий Socket.IO (в обе стороны)
 // ---------------------------------------------------------------------------
@@ -105,6 +122,7 @@ export interface PlayerLeftPayload {
 export interface ClientToServerEvents {
   joinRoom: (payload: JoinRoomPayload, ack: (response: JoinRoomAck) => void) => void
   playerInput: (payload: PlayerInput) => void
+  playerPose: (payload: PlayerPosePayload) => void
   playerTransform: (payload: PlayerTransformPayload) => void
   levelComplete: (payload: LevelCompletePayload) => void
   leaveRoom: () => void

@@ -5,21 +5,30 @@ import {
   type GameStateSnapshot,
   type PlayerForm,
   type PlayerInput,
+  type PlayerPosePayload,
   type PlayerState,
 } from "../../../shared/game-protocol"
 
 /**
- * Держит авторитетное игровое состояние (позиции игроков) по комнатам и
- * применяет к нему ввод. Позиция игрока НИКОГДА не берётся из того, что
- * прислал клиент напрямую — только из stepPlayerState на сервере (это и
- * есть "server authoritative": клиент лишь предлагает ввод, а не координаты).
+ * Держит игровое состояние игроков по комнатам и рассылает его остальным.
+ * Два независимых пути записи в состояние сосуществуют:
  *
- * Упрощение (осознанное, не забытая доработка): сервер держит не очередь
- * всех инпутов игрока, а только САМЫЙ СВЕЖИЙ (по seq) — и раз в тик
- * интегрирует по нему один раз. Полная история инпутов и их построчный
- * replay нужны только на клиенте (GameNetworkStore) для honest reconciliation
- * локального игрока; серверу для авторитетной позиции достаточно знать
- * "текущую волю" игрока на момент тика.
+ *  - queueInput()/tickRoom() — generic-путь: сервер сам считает позицию через
+ *    stepPlayerState (честный "server authoritative" для абстрактного 2D-
+ *    движения). Оставлен как переиспользуемая инфраструктура.
+ *
+ *  - setPose() — путь, которым реально ходит Twin Morph: копание/трава/стены
+ *    процедурны и генерируются на каждом клиенте отдельно, сервер их не
+ *    знает и не может честно пересчитать столкновения. Поэтому тут сервер —
+ *    не физический авторитет, а просто доверенный ретранслятор: держит
+ *    последнюю присланную клиентом позу (уже посчитанную ЕГО собственным
+ *    Worm/Ant с учётом стен) и рассылает её остальным в комнате.
+ *
+ * tickRoom() ничего не ломает при setPose(): раз для позы, переданной через
+ * setPose(), никогда не приходит соответствующий playerInput, ветка
+ * "input ? stepPlayerState(...) : state" в tickRoom просто пропускает шаг
+ * интеграции и переносит текущее (уже установленное setPose) состояние как
+ * есть — то есть один и тот же тик обслуживает оба пути без конфликтов.
  */
 @Injectable()
 export class GameService {
@@ -49,6 +58,15 @@ export class GameService {
     if (!current || input.seq > current.seq) {
       this.latestInputByPlayer.set(playerId, input)
     }
+  }
+
+  /** Клиент прислал уже посчитанную у себя позицию (реальный Worm/Ant) — просто сохраняем её как текущую. */
+  public setPose(roomId: string, playerId: string, pose: PlayerPosePayload): void {
+    const states = this.statesByRoom.get(roomId)
+    if (!states) return
+
+    const current = states.get(playerId) ?? createInitialPlayerState(playerId, pose.form)
+    states.set(playerId, { ...current, x: pose.x, y: pose.y, form: pose.form })
   }
 
   public setPlayerForm(roomId: string, playerId: string, form: PlayerForm): void {

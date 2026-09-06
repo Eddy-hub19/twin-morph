@@ -32,8 +32,11 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
-.env*
+# env files — *.local — секретные/локальные оверрайды, никогда не коммитим.
+# .env.production — только публичный NEXT_PUBLIC_GAME_SERVER_URL (не секрет),
+# коммитится намеренно, см. .env.production в репозитории.
+.env*.local
+server/.env
 
 # vercel
 .vercel

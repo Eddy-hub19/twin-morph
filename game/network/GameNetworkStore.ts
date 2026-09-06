@@ -67,6 +67,8 @@ export class GameNetworkStore {
 
   private socket: TypedGameSocket | null = null
   private hasJoinedBefore = false
+  /** roomId, запрошенный при старте co-op (из ссылки-приглашения) — переиспользуется при reconnect. */
+  private requestedRoomId: string | undefined
 
   private inputSeq = 0
   /** Инпуты локального игрока, которые ещё не подтверждены сервером (по seq) — используются для reconciliation. */
@@ -75,6 +77,7 @@ export class GameNetworkStore {
 
   private lastInputSentAt = 0
   private readonly minInputIntervalMs = 1000 / SERVER_TICK_RATE
+  private lastPoseSentAt = 0
 
   private listeners = new Set<Listener>()
   private cachedSnapshot: NetworkSnapshot = this.computeSnapshot()
@@ -122,11 +125,18 @@ export class GameNetworkStore {
     this.notify()
   }
 
-  /** Co-op 2 Players — подключается к NestJS-серверу, автоматически создаёт/находит комнату. */
-  public async startCoop(): Promise<RoomInfo> {
+  /**
+   * Co-op 2 Players — подключается к NestJS-серверу. Без roomId сервер сам
+   * находит свободную комнату или создаёт новую (auto create/join); с
+   * roomId (например, из ссылки-приглашения — см. ModeSelect) пытается
+   * присоединиться именно к ней, и только если она вдруг уже полна/не
+   * существует — откатывается к обычному автопоиску (см. RoomService).
+   */
+  public async startCoop(roomId?: string): Promise<RoomInfo> {
     this.reset()
     this.mode = "coop"
     this.connectionStatus = "connecting"
+    this.requestedRoomId = roomId
     this.notify()
 
     const socket = GameSocket.getInstance().connect()
@@ -142,7 +152,7 @@ export class GameNetworkStore {
     const sessionId = GameSocket.getInstance().getSessionId()
 
     return new Promise((resolve, reject) => {
-      socket.emit("joinRoom", { mode: "coop", sessionId }, (ack) => {
+      socket.emit("joinRoom", { mode: "coop", sessionId, roomId: this.requestedRoomId }, (ack) => {
         if (!ack.ok || !ack.room || !ack.playerId) {
           this.connectionStatus = "disconnected"
           this.notify()
@@ -243,6 +253,29 @@ export class GameNetworkStore {
 
     this.lastInputSentAt = now
     this.socket?.emit("playerInput", input)
+  }
+
+  /**
+   * Реальный путь синхронизации Twin Morph: GameScene вызывает это каждый
+   * кадр С УЖЕ ПОСЧИТАННОЙ позицией своего Worm/Ant (учитывающей стены,
+   * копание, линию травы — то, что stepPlayerState выше не знает и знать
+   * не может, раз уровень у каждого клиента свой процедурно сгенерированный).
+   * В отличие от update()/sendInputThrottled — тут нет ни local prediction,
+   * ни seq: локальный игрок и так уже полностью авторитетен сам для себя,
+   * серверу остаётся только держать и ретранслировать его позу остальным
+   * (см. GameService.setPose на сервере).
+   */
+  public reportLocalPose(x: number, y: number, form: PlayerForm): void {
+    if (!this.localState) return
+
+    this.localState = { ...this.localState, x, y, form }
+    if (this.mode !== "coop") return
+
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now()
+    if (now - this.lastPoseSentAt < this.minInputIntervalMs) return
+
+    this.lastPoseSentAt = now
+    this.socket?.emit("playerPose", { x, y, form })
   }
 
   private handleSnapshot(snapshot: GameStateSnapshot): void {
@@ -354,9 +387,11 @@ export class GameNetworkStore {
     this.localState = null
     this.socket = null
     this.hasJoinedBefore = false
+    this.requestedRoomId = undefined
     this.inputSeq = 0
     this.pendingInputs = []
     this.remoteBuffers.clear()
     this.lastInputSentAt = 0
+    this.lastPoseSentAt = 0
   }
 }

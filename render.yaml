@@ -1,0 +1,19 @@
+# Render Blueprint — деплоит только server/ (NestJS co-op сервер) как
+# отдельный веб-сервис. Фронтенд (Next.js) на Render не деплоится — он живёт
+# на Vercel (https://twin-morph.vercel.app), см. .env.production.
+#
+# Использование: New -> Blueprint в Render, указать этот репозиторий — CLIENT_ORIGIN
+# ниже уже указывает на прод-адрес Vercel, менять ничего не нужно.
+services:
+  - type: web
+    name: twin-morph-server
+    runtime: node
+    rootDir: server
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: FRONTEND_URL
+        value: https://twin-morph.vercel.app
+      - key: NODE_VERSION
+        value: 20.19.0

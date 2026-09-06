@@ -96,6 +96,10 @@
   transform: translateX(-50%);
   z-index: 15;
 
+  display: flex;
+  align-items: center;
+  gap: 10px;
+
   background: rgba(20, 24, 28, 0.55);
   border: 1px solid rgba(255, 255, 255, 0.3);
   border-radius: 999px;
@@ -104,4 +108,20 @@
   font-size: 13px;
   color: #f5efe6;
   pointer-events: none;
+}
+
+.copyLinkButton {
+  pointer-events: auto;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  padding: 3px 10px;
+  cursor: pointer;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.22);
+  }
 }
