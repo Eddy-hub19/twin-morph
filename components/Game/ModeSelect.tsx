@@ -2,6 +2,9 @@
 
 import { useEffect, useState } from "react"
 import { useGameSocket } from "@/hooks/useGameSocket"
+import { getGameServerUrl } from "@/game/network/GameSocket"
+import { isLocalServerUrl, waitForServerReady } from "@/game/network/serverHealth"
+import ServerLoadingScreen from "./ServerLoadingScreen"
 import styles from "./ModeSelect.module.scss"
 
 interface ModeSelectProps {
@@ -30,7 +33,9 @@ function setRoomInUrl(roomId: string | null): void {
 /**
  * Экран выбора режима перед стартом. Single Player стартует мгновенно, без
  * сети. Co-op подключается к NestJS-серверу через useGameSocket и ждёт ack
- * от комнаты, прежде чем пускать в игру.
+ * от комнаты, прежде чем пускать в игру — но перед самим подключением сперва
+ * дожидается, пока сервер вообще проснётся (см. ServerLoadingScreen/
+ * serverHealth.ts: бесплатный план Render "засыпает" после простоя).
  *
  * Подключение к комнате по ссылке: если открыть страницу с ?room=<id> в
  * адресе (ссылка, которую скопировал/отправил первый игрок — см.
@@ -40,12 +45,26 @@ function setRoomInUrl(roomId: string | null): void {
 export default function ModeSelect({ onReady }: ModeSelectProps) {
   const { startSolo, startCoop } = useGameSocket()
   const [isConnecting, setIsConnecting] = useState(false)
+  const [elapsedMs, setElapsedMs] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [invitedRoomId, setInvitedRoomId] = useState<string | null>(null)
 
   useEffect(() => {
     const roomId = new URLSearchParams(window.location.search).get(ROOM_QUERY_PARAM)
     setInvitedRoomId(roomId)
+
+    // Будим сервер заранее, ещё пока игрок читает экран выбора режима — не
+    // ждём, пока он нажмёт "Co-op": фоновый пинг молча запускает "холодный
+    // старт" на Render немного раньше, реального UI это не блокирует (ошибки
+    // тут не показываем — если не получилось, обычная попытка при клике по
+    // Co-op всё равно подождёт сервер явно, с нормальным лоадером).
+    //
+    // maxWaitMs НЕ переопределяем тут явно — оставляем serverHealth решать
+    // сам (90с для прод-адреса, но всего 6с для localhost, см. isLocalServerUrl):
+    // раньше здесь стояло фиксированных 90с, и локально, если backend просто
+    // не запущен, это означало 90 секунд повторяющихся GET .../health раз в
+    // 1.5с в консоли — не "загрузка", а просто шум без единого шанса на успех.
+    waitForServerReady(getGameServerUrl()).catch(() => {})
   }, [])
 
   const handleSolo = () => {
@@ -59,7 +78,20 @@ export default function ModeSelect({ onReady }: ModeSelectProps) {
   const handleCoop = async (roomId?: string) => {
     setError(null)
     setIsConnecting(true)
+    setElapsedMs(0)
     try {
+      const serverUrl = getGameServerUrl()
+      const serverReady = await waitForServerReady(serverUrl, {
+        onAttempt: (_attempt, elapsed) => setElapsedMs(elapsed),
+      })
+      if (!serverReady) {
+        throw new Error(
+          isLocalServerUrl(serverUrl)
+            ? "Локальный co-op сервер не отвечает — запусти его командой npm run dev:server"
+            : "Сервер не отвечает — попробуйте ещё раз чуть позже",
+        )
+      }
+
       const room = await startCoop(roomId)
       setRoomInUrl(room.roomId)
       onReady()
@@ -68,6 +100,10 @@ export default function ModeSelect({ onReady }: ModeSelectProps) {
     } finally {
       setIsConnecting(false)
     }
+  }
+
+  if (isConnecting) {
+    return <ServerLoadingScreen elapsedMs={elapsedMs} isLocal={isLocalServerUrl(getGameServerUrl())} />
   }
 
   if (invitedRoomId) {
@@ -80,9 +116,7 @@ export default function ModeSelect({ onReady }: ModeSelectProps) {
           <button className={styles.option} onClick={() => handleCoop(invitedRoomId)} disabled={isConnecting}>
             <span className={styles.optionIcon}>🐜</span>
             <span className={styles.optionLabel}>Присоединиться</span>
-            <span className={styles.optionHint}>
-              {isConnecting ? "Подключение…" : `Комната ${invitedRoomId.slice(0, 8)}`}
-            </span>
+            <span className={styles.optionHint}>{`Комната ${invitedRoomId.slice(0, 8)}`}</span>
           </button>
 
           <button className={styles.option} onClick={handleSolo} disabled={isConnecting}>
@@ -111,8 +145,8 @@ export default function ModeSelect({ onReady }: ModeSelectProps) {
 
         <button className={styles.option} onClick={() => handleCoop()} disabled={isConnecting}>
           <span className={styles.optionIcon}>🐜</span>
-          <span className={styles.optionLabel}> twin players</span>
-          <span className={styles.optionHint}>{isConnecting ? "Подключение…" : "Подключиться к комнате"}</span>
+          <span className={styles.optionLabel}>Co-op (2 игрока)</span>
+          <span className={styles.optionHint}>Подключиться к комнате</span>
         </button>
       </div>
 

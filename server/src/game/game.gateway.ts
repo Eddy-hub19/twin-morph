@@ -19,6 +19,7 @@ import type {
 import { RoomService } from "./room.service"
 import { GameService } from "./game.service"
 import { GameLoopService } from "./game-loop.service"
+import { getFrontendUrl } from "../frontend-url"
 
 /** Данные, которые гейтвей прикрепляет к сокету после успешного joinRoom —
  * socket.io типизирует client.data как unknown/any, поэтому объявляем форму сами. */
@@ -31,7 +32,7 @@ interface SocketSessionData {
 type GameSocket = Socket & { data: SocketSessionData }
 
 @WebSocketGateway({
-  cors: { origin: process.env.FRONTEND_URL ?? "http://localhost:3000", credentials: true },
+  cors: { origin: getFrontendUrl(), credentials: true },
 })
 export class GameGateway implements OnGatewayInit, OnGatewayDisconnect {
   @WebSocketServer()

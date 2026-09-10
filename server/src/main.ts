@@ -1,11 +1,12 @@
 import "reflect-metadata"
 import { NestFactory } from "@nestjs/core"
 import { AppModule } from "./app.module"
+import { getFrontendUrl } from "./frontend-url"
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule)
 
-  const frontendUrl = process.env.FRONTEND_URL ?? "http://localhost:3000"
+  const frontendUrl = getFrontendUrl()
   app.enableCors({
     origin: frontendUrl,
     credentials: true,

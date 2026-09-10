@@ -25,6 +25,26 @@ npm run dev               # Next.js, порт 3000 — в отдельном т�
   `npm install && npm run build`, Start Command `npm run start`, переменная
   `FRONTEND_URL=https://twin-morph.vercel.app` (см. `server/.env.example`).
   `PORT` подставляет сам Render, ничего указывать не нужно.
+- Если `NEXT_PUBLIC_SOCKET_URL` вдруг не долетел до билда (переменная не
+  успела появиться в Vercel к моменту сборки — `NEXT_PUBLIC_*` впечатываются
+  в бандл на этапе билда, а не читаются заново в браузере), `GameSocket.ts`
+  всё равно не пытается стучаться на `localhost` в проде: при
+  `NODE_ENV === "production"` запасной адрес — сам `https://twin-morph.onrender.com`.
+
+## Холодный старт сервера (Render free tier)
+
+Бесплатный план Render "усыпляет" контейнер после простоя — первый запрос
+может ждать до минуты. Поэтому подключение к co-op — не просто
+`GameSocket.connect()`, а сперва `waitForServerReady()`
+(`game/network/serverHealth.ts`): опрашивает обычный HTTP `GET /health`
+(`server/src/app.controller.ts`) раз в 1.5с, пока не получит 200 — WebSocket-
+хендшейк для определения "жив ли сервер" не подходит (просто зависает без
+понятного прогресса). Пока ждём — `ServerLoadingScreen` на весь экран
+(спиннер + текст, который через 4 секунды меняется на "сервер просыпается,
+это может занять до минуты" со счётчиком секунд). `ModeSelect` дополнительно
+шлёт такой же пинг в фоне сразу при открытии экрана выбора режима — если
+игрок читает текст и решает пару секунд, сервер к этому моменту уже
+подтягивается сам, реального ожидания на экране загрузки часто вообще не будет.
 
 ## Режимы
 
@@ -100,10 +120,13 @@ npm run dev               # Next.js, порт 3000 — в отдельном т�
 | Сервер | `server/src/game/room.service.ts` | Комнаты, sessionId, reconnect, cleanup |
 | Сервер | `server/src/game/game.service.ts` | Состояние игроков (pose-relay + generic-инфра) |
 | Сервер | `server/src/game/game-loop.service.ts` | Тик 20 Гц, рассылка снапшотов |
+| Сервер | `server/src/app.controller.ts` | `/` и `/health` — обычный HTTP, не Socket.IO |
 | Клиент | `game/network/GameSocket.ts` | Singleton `socket.io-client` + sessionId |
 | Клиент | `game/network/GameNetworkStore.ts` | `reportLocalPose`, remote interpolation, solo/co-op |
+| Клиент | `game/network/serverHealth.ts` | Пинг `/health` перед подключением (холодный старт Render) |
 | Клиент | `hooks/useGameSocket.ts` | React-обвязка (`useSyncExternalStore`) |
 | Клиент | `components/Game/ModeSelect.tsx` | Выбор режима + подключение по ссылке |
+| Клиент | `components/Game/ServerLoadingScreen.tsx` | Полноэкранная загрузка на время холодного старта |
 | Клиент | `components/Game/RoomStatusBadge.tsx` | Статус комнаты + копирование ссылки |
 | Клиент | `game/scenes/GameScene.ts` | `syncNetwork()`/`upsertRemoteEntity()` — рендер напарника |
 

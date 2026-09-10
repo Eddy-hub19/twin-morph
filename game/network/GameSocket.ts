@@ -3,10 +3,24 @@ import type { ClientToServerEvents, ServerToClientEvents } from "@/shared/game-p
 
 const SESSION_STORAGE_KEY = "twin-morph.sessionId"
 
-/** Адрес NestJS co-op сервера — в single player эта переменная вообще не читается. */
-const SERVER_URL = process.env.NEXT_PUBLIC_SOCKET_URL ?? "http://localhost:3001"
+/**
+ * Продакшн-адрес зашит запасным вариантом на случай, если NEXT_PUBLIC_SOCKET_URL
+ * не долетел до билда (например, в Vercel переменная окружения ещё не была
+ * настроена на момент первого деплоя — NEXT_PUBLIC_* значения впечатываются
+ * в бандл на этапе сборки, а не читаются заново в браузере) — тогда прод-сборка
+ * всё равно не пытается стучаться на localhost. process.env.NODE_ENV тоже
+ * впечатывается сборщиком, так что это условие честно решается на этапе билда.
+ */
+const SERVER_URL =
+  process.env.NEXT_PUBLIC_SOCKET_URL ?? (process.env.NODE_ENV === "production" ? "https://twin-morph.onrender.com" : "http://localhost:3001")
 
 export type TypedGameSocket = Socket<ServerToClientEvents, ClientToServerEvents>
+
+/** Адрес co-op сервера, которым реально пользуется GameSocket — нужен снаружи
+ * (см. game/network/serverHealth.ts) для health-check пинга перед подключением. */
+export function getGameServerUrl(): string {
+  return SERVER_URL
+}
 
 /**
  * Единственный на вкладку Socket.IO-клиент (singleton) — весь co-op трафик
