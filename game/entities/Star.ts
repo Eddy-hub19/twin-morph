@@ -3,8 +3,14 @@ import { Entity } from "./Entity"
 import { STAR_SIZE } from "../config/GameConfig"
 
 export class Star extends Entity {
-  constructor(x: number, y: number) {
+  /** Стабильный id ("level:star:index") — одинаковый на обоих клиентах, раз
+   * оба генерируют звёзды в одном и том же порядке из общего seed. По нему
+   * сервер не даёт засчитать одну и ту же звезду дважды (см. GameScene). */
+  public readonly id: string
+
+  constructor(x: number, y: number, id: string) {
     super()
+    this.id = id
     this.container.x = x
     this.container.y = y
 

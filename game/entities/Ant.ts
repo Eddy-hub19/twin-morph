@@ -2,6 +2,7 @@ import { Assets, AnimatedSprite, Container, Sprite, Texture } from "pixi.js"
 import { Entity } from "./Entity"
 import { Wall } from "./Wall"
 import { Star } from "./Star"
+import { PlayerCosmetics, type PartnerRole } from "./PlayerCosmetics"
 import {
   ANT_SPEED,
   ANT_DESIRED_HEIGHT,
@@ -57,7 +58,13 @@ export class Ant extends Entity {
 
   private vx = 0
   private speed = ANT_SPEED
+  /** Пузырёк скорости (co-op — общий на комнату) временно множит скорость —
+   * см. GameScene.updateSpeedBoost. 1 = обычная скорость. */
+  public speedMultiplier = 1
   private input: any
+
+  private readonly cosmetics = new PlayerCosmetics()
+  private spriteReady!: Promise<void>
 
   /** Убивает муравья извне (например, столкновение со стражем). */
   public kill(): void {
@@ -93,7 +100,15 @@ export class Ant extends Entity {
     this.container.y = y
     this.input = input
 
-    this.setupSprite()
+    this.spriteReady = this.setupSprite()
+  }
+
+  /** Co-op: помечает этого муравья как напарника — контур + аксессуар над
+   * головой (см. PlayerCosmetics). Локальный игрок этот метод не вызывает —
+   * отличать нужно только напарника, не себя самого. */
+  public async applyRemoteLook(role: PartnerRole): Promise<void> {
+    await this.spriteReady
+    if (this.sprite) await this.cosmetics.apply(this.sprite, role)
   }
 
   private async setupSprite(): Promise<void> {
@@ -201,14 +216,14 @@ export class Ant extends Entity {
 
     if (this.input.isDown("ArrowLeft") || this.input.isDown("KeyA") || (analog !== null && analog.x < -ANT_ANALOG_DEADZONE)) {
       const magnitude = analog !== null && analog.x < 0 ? Math.min(1, -analog.x) : 1
-      this.vx = -this.speed * deltaTime * magnitude
+      this.vx = -this.speed * this.speedMultiplier * deltaTime * magnitude
       // Спрайт нарисован головой вправо — разворачиваем влево отражением.
       this.sprite.scale.x = -Math.abs(this.sprite.scale.y)
       isMoving = true
     }
     if (this.input.isDown("ArrowRight") || this.input.isDown("KeyD") || (analog !== null && analog.x > ANT_ANALOG_DEADZONE)) {
       const magnitude = analog !== null && analog.x > 0 ? Math.min(1, analog.x) : 1
-      this.vx = this.speed * deltaTime * magnitude
+      this.vx = this.speed * this.speedMultiplier * deltaTime * magnitude
       this.sprite.scale.x = Math.abs(this.sprite.scale.y)
       isMoving = true
     }

@@ -3,6 +3,7 @@ import type { Server } from "socket.io"
 import { SERVER_TICK_MS } from "../../../shared/game-protocol"
 import { RoomService } from "./room.service"
 import { GameService } from "./game.service"
+import { LevelStateService } from "./level-state.service"
 
 /**
  * Единственный игровой цикл сервера — фиксированный тик (SERVER_TICK_MS),
@@ -22,6 +23,7 @@ export class GameLoopService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly roomService: RoomService,
     private readonly gameService: GameService,
+    private readonly levelState: LevelStateService,
   ) {}
 
   public attachServer(server: Server): void {
@@ -55,6 +57,7 @@ export class GameLoopService implements OnModuleInit, OnModuleDestroy {
 
       if (entry.roomDeleted) {
         this.gameService.removeRoom(entry.roomId)
+        this.levelState.removeRoom(entry.roomId)
         continue
       }
 

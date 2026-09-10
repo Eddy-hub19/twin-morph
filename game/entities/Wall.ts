@@ -15,13 +15,27 @@ export class Wall extends Entity {
   /** Прочность блока в начале (для расчёта визуального прогресса). */
   public readonly maxHitPoints: number
 
-  constructor(x: number, y: number, width: number, height: number, type: WallType = "dirt") {
+  /** Стабильный id ("level:x:y" в мировых координатах) — только у блоков
+   * уровней 0/1 (см. GameScene.generateNextLevel); используется для co-op
+   * синхронизации копания (см. GameScene.reportWallHit/applyRemoteHits) —
+   * оба клиента ставят один и тот же блок по этому же ключу, раз оба
+   * генерируют карту из общего seed в одном и том же порядке. */
+  public readonly cellKey?: string
+
+  /** true сразу после локального hit() — GameScene раз в кадр вычерпывает
+   * такие блоки и репортит удар остальным в комнате, затем сбрасывает флаг
+   * (см. комментарий у cellKey). Не путать с applyRemoteHits() — тот, наоборот,
+   * применяет ЧУЖОЙ удар и флаг не трогает, чтобы не заэхивать его обратно в сеть. */
+  public justHit = false
+
+  constructor(x: number, y: number, width: number, height: number, type: WallType = "dirt", cellKey?: string) {
     super()
     this.type = type
     this.container.x = x
     this.container.y = y
     this.width = width
     this.height = height
+    this.cellKey = cellKey
 
     this.maxHitPoints = type === "ore" ? ORE_HIT_POINTS : 1
     this.hitPoints = this.maxHitPoints
@@ -93,6 +107,7 @@ export class Wall extends Entity {
     }
 
     this.hitPoints = Math.max(this.hitPoints - 1, 0)
+    this.justHit = true
 
     if (this.hitPoints <= 0) {
       this.container.visible = false
@@ -103,6 +118,23 @@ export class Wall extends Entity {
     // прогресс прогрызания у многоударных блоков.
     this.container.alpha = 0.35 + 0.65 * (this.hitPoints / this.maxHitPoints)
     return false
+  }
+
+  /** Применяет ЧУЖОЙ (уже случившийся у партнёра/сохранённый на сервере)
+   * удар — то же самое, что hit(), но напрямую по итоговому числу ударов и
+   * БЕЗ повторного выставления justHit (иначе GameScene тут же отправила бы
+   * его обратно в сеть, как будто это новый локальный удар — бесконечное эхо). */
+  public applyRemoteHits(hits: number): void {
+    if (this.type === "bedrock") return
+
+    this.hitPoints = Math.max(0, this.maxHitPoints - hits)
+
+    if (this.hitPoints <= 0) {
+      this.container.visible = false
+      return
+    }
+
+    this.container.alpha = 0.35 + 0.65 * (this.hitPoints / this.maxHitPoints)
   }
 
   public update(): void {}

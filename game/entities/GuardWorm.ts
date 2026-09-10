@@ -1,6 +1,7 @@
 import { Assets, Sprite, Texture } from "pixi.js"
 import { Entity } from "./Entity"
 import { Wall, findWallAt } from "./Wall"
+import type { EnemyNetState } from "../../shared/game-protocol"
 import {
   GUARD_PATROL_SPEED as PATROL_SPEED,
   GUARD_ALERT_SPEED as ALERT_SPEED,
@@ -8,6 +9,7 @@ import {
   GUARD_LOSE_RADIUS as LOSE_RADIUS,
   GUARD_PATROL_REACH as PATROL_REACH,
   GUARD_AREA_MARGIN,
+  GUARD_DESIRED_WIDTH,
 } from "../config/GameConfig"
 
 /**
@@ -33,11 +35,17 @@ export class GuardWorm extends Entity {
   private readonly patrolBY: number
   private towardB = true
 
+  /** Co-op: гость только отрисовывает состояние от хоста, см. EnemyWorm.puppet. */
+  private puppet = false
+
   constructor(
     x: number,
     y: number,
     private areaTop: number,
     private areaHeight: number,
+    /** Стабильный id ("guard:0") — страж один на уровень, но id всё равно
+     * через тот же механизм, что и обычные враги. */
+    public readonly remoteId: string = "guard:0",
   ) {
     super()
     this.container.x = x
@@ -51,6 +59,26 @@ export class GuardWorm extends Entity {
     this.patrolBY = y
   }
 
+  /** Гость применяет состояние, присланное хостом, вместо своего ИИ. */
+  public setRemoteState(state: EnemyNetState): void {
+    this.puppet = true
+    this.container.x = state.x
+    this.container.y = state.y
+    this.container.rotation = state.rotation
+  }
+
+  public toNetState(): EnemyNetState {
+    return {
+      id: this.remoteId,
+      kind: "guard",
+      x: this.container.x,
+      y: this.container.y,
+      rotation: this.container.rotation,
+      alive: true,
+      carryingStarId: null,
+    }
+  }
+
   public async init(): Promise<void> {
     if (this.sprite) {
       return
@@ -62,6 +90,13 @@ export class GuardWorm extends Entity {
     this.sprite.anchor.set(0.5)
     // Красноватый оттенок — визуально отличает стража от обычных воров.
     this.sprite.tint = 0xff8a6a
+
+    // Текстура вдвое шире клетки сетки — без масштаба страж торчал бы из
+    // прокопанного туннеля в обе стены сразу. Коллайдер (width/height)
+    // считаем ИЗ уже применённого масштаба, а не из сырых размеров текстуры,
+    // иначе видимый размер и зона столкновения разойдутся.
+    const scale = GUARD_DESIRED_WIDTH / this.sprite.texture.width
+    this.sprite.scale.set(scale)
 
     this.width = this.sprite.width
     this.height = this.sprite.height
@@ -86,6 +121,12 @@ export class GuardWorm extends Entity {
    */
   public tick(deltaTime: number, walls: Wall[] = [], playerX?: number, playerY?: number): void {
     if (!this.sprite) {
+      return
+    }
+
+    // Гость комнаты не считает патруль/погоню сам — двигается через
+    // setRemoteState() по данным хоста (см. комментарий у puppet выше).
+    if (this.puppet) {
       return
     }
 

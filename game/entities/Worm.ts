@@ -3,12 +3,16 @@ import { Entity } from "./Entity"
 import { InputManager } from "../input/InputManager"
 import { Wall } from "./Wall"
 import { Star } from "./Star"
+import { PlayerCosmetics, type PartnerRole } from "./PlayerCosmetics"
 import { WORM_SPEED, WORM_DIG_HIT_INTERVAL } from "../config/GameConfig"
 
 type AnimationState = "idle" | "walk" | "dead"
 
 export class Worm extends Entity {
   private speed = WORM_SPEED
+  /** Пузырёк скорости (co-op — общий на комнату) временно множит скорость —
+   * см. GameScene.updateSpeedBoost. 1 = обычная скорость. */
+  public speedMultiplier = 1
 
   private sprite?: AnimatedSprite
   private animationState: AnimationState = "idle"
@@ -19,8 +23,18 @@ export class Worm extends Entity {
   private digProgress = 0
   private readonly digHitInterval = WORM_DIG_HIT_INTERVAL
 
+  private readonly cosmetics = new PlayerCosmetics()
+
   constructor(private input: InputManager) {
     super()
+  }
+
+  /** Co-op: помечает этого червя как напарника — контур + аксессуар над
+   * головой (см. PlayerCosmetics). Локальный игрок этот метод не вызывает —
+   * он и так знает, кто он такой; отличать нужно только напарника. */
+  public async applyRemoteLook(role: PartnerRole): Promise<void> {
+    await this.init()
+    if (this.sprite) await this.cosmetics.apply(this.sprite, role)
   }
 
   public async init(): Promise<void> {
@@ -60,7 +74,7 @@ export class Worm extends Entity {
       return
     }
 
-    const moveSpeed = this.speed * deltaTime
+    const moveSpeed = this.speed * this.speedMultiplier * deltaTime
 
     let moving = false
     let nextX = this.container.x

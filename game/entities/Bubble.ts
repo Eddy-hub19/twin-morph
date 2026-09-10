@@ -9,8 +9,12 @@ import { BUBBLE_SIZE } from "../config/GameConfig"
  * явно отличаться от золотых звёзд и жёлтых блоков руды.
  */
 export class Bubble extends Entity {
-  constructor(x: number, y: number) {
+  /** Стабильный id ("level:bubble:index") — см. Star.id, тот же принцип. */
+  public readonly id: string
+
+  constructor(x: number, y: number, id: string) {
     super()
+    this.id = id
     this.container.x = x
     this.container.y = y
 
