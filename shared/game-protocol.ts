@@ -59,6 +59,70 @@ export interface RoomInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Общий мир копания (уровни 0/1) — карта, копание, враги, свет, звёзды.
+//
+// Уровни 2+ (бег муравья по поверхности) сюда не входят: там нет ни камня,
+// ни звёзд, ни врагов (см. GameScene.generateNextLevel — при level > 1 весь
+// этот спавн уже пропускается в самом клиенте), так что делить их между
+// игроками просто нечего. Вся секция ниже — про то немногое, ЧТО РЕАЛЬНО
+// нужно шарить: seed процедурной генерации (см. shared/rng.ts — оба клиента
+// получают одно и то же число и генерируют побитово одинаковую карту сами,
+// а не пересылают её целиком), диффы уже прогрызенных блоков, кто уже забрал
+// одноразовые предметы (звёзды/пузырьки/факел) и состояние врагов.
+// ---------------------------------------------------------------------------
+
+/** Один вражеский червяк или страж — минимум, нужный, чтобы отрисовать его у
+ * партнёра (не-хосту): позиция, поворот, жив ли, что несёт. */
+export interface EnemyNetState {
+  id: string
+  kind: "enemy" | "guard"
+  x: number
+  y: number
+  rotation: number
+  alive: boolean
+  /** id звезды, которую сейчас тащит (см. StarCollectedPayload.starId) — null, если ничего не несёт. */
+  carryingStarId: string | null
+}
+
+/**
+ * Полное состояние ТЕКУЩЕГО общего уровня комнаты (всегда level 0 или 1 —
+ * следующего уровня, пока текущий не пройден оба сразу, попросту не
+ * существует). Ровно это возвращается новому/переподключившемуся игроку —
+ * "полный текущий снапшот комнаты", а не пустая карта с нуля.
+ */
+export interface RoomLevelState {
+  level: number
+  seed: number
+  /** Ширина/высота уровня в мировых px — решается ОДИН раз, тем клиентом, чей
+   * запрос (ensureLevel/advanceLevel/roomRestart) первым завёл это состояние
+   * (обычно его собственный digLevelWidth()/digLevelHeight() — см. GameScene).
+   * Второй клиент ОБЯЗАН сгенерировать уровень с ЭТИМИ размерами, даже если
+   * его собственный viewport другого размера (иначе разъедутся сами мировые
+   * координаты клеток — общий seed один в один совпадающую карту даёт только
+   * при совпадающих границах генерации). */
+  width: number
+  height: number
+  /** cellKey ("x:y" в мировых координатах, общих для всей комнаты — см.
+   * GameScene.cellKey) -> сколько ударов по этому блоку уже засчитано.
+   * Отсутствует в объекте — блок ещё цел (полная прочность). Это и есть
+   * "дифф изменённых клеток", а не карта целиком. */
+  wallHits: Record<string, number>
+  /** id уже подобранных (кем угодно) одноразовых предметов ТЕКУЩЕГО уровня —
+   * звёзды, факел, пузырьки. Общий Set для всех типов, раз у них одна и та
+   * же семантика "первый забрал — предмет исчезает для всех". */
+  collectedItemIds: string[]
+  /** 0, если факел сейчас не горит; иначе abs. unix-время (мс) окончания —
+   * оба клиента считают оставшееся время от него самостоятельно, без дрейфа. */
+  lightEndsAt: number
+  /** То же самое для пузырька скорости — 0, если буст сейчас неактивен. */
+  speedBoostEndsAt: number
+  /** Суммарная добавка к радиусу света от уже собранных пузырьков света —
+   * в отличие от факела/скорости это не таймер, а постоянный бонус уровня. */
+  lightRadiusBonus: number
+  enemies: EnemyNetState[]
+}
+
+// ---------------------------------------------------------------------------
 // Payload'ы конкретных событий
 // ---------------------------------------------------------------------------
 
@@ -77,6 +141,132 @@ export interface JoinRoomAck {
   error?: string
   room?: RoomInfo
   playerId?: string
+  /** Сколько раз комната была перезапущена целиком (см. RoomRestartPayload) —
+   * растёт монотонно, используется, чтобы отличать актуальные широковещательные
+   * события от устаревших (пришедших уже после следующего рестарта/перехода). */
+  epoch?: number
+  /** Общий счёт звёзд команды на момент входа — 0 для новой комнаты, иначе
+   * актуальный счёт (см. StarCollectedPayload). */
+  teamStars?: number
+  /** Текущее состояние общего уровня (0/1) комнаты — null, если её ещё
+   * никто не начал генерировать (самый первый вход в свежую комнату).
+   * Это и есть "полный текущий снапшот" для новых/переподключившихся
+   * игроков — им не нужно генерировать level 0 с нуля вслепую. */
+  levelState?: RoomLevelState | null
+}
+
+export interface EnsureLevelPayload {
+  roomId: string
+  level: number
+  /** Предлагаемые размеры (собственный digLevelWidth()/Height() отправителя) —
+   * используются, только если для этого уровня ЕЩЁ нет состояния; иначе
+   * сервер возвращает уже сохранённые (см. RoomLevelState.width/height). */
+  width: number
+  height: number
+}
+
+export interface EnsureLevelAck {
+  ok: boolean
+  levelState?: RoomLevelState
+  teamStars?: number
+  epoch?: number
+}
+
+export interface AdvanceLevelPayload {
+  roomId: string
+  fromLevel: number
+  toLevel: number
+  width: number
+  height: number
+}
+
+export interface LevelAdvancedPayload {
+  levelState: RoomLevelState
+  teamStars: number
+  epoch: number
+}
+
+export interface RoomRestartRequestPayload {
+  roomId: string
+  width: number
+  height: number
+}
+
+export interface RoomRestartPayload {
+  levelState: RoomLevelState
+  teamStars: number
+  epoch: number
+}
+
+export interface WallHitPayload {
+  roomId: string
+  level: number
+  epoch: number
+  cellKey: string
+  hits: number
+  destroyed: boolean
+}
+
+export interface WallUpdatedPayload {
+  level: number
+  epoch: number
+  cellKey: string
+  hits: number
+  destroyed: boolean
+}
+
+export interface StarPickupPayload {
+  roomId: string
+  level: number
+  epoch: number
+  starId: string
+}
+
+export interface StarCollectedPayload {
+  level: number
+  epoch: number
+  starId: string
+  teamStars: number
+}
+
+export type BoostKind = "light" | "speed"
+
+export interface LightActivatePayload {
+  roomId: string
+  level: number
+  epoch: number
+  switchId: string
+}
+
+export interface LightUpdatePayload {
+  level: number
+  epoch: number
+  switchId: string
+  lightEndsAt: number
+}
+
+export interface BoostActivatePayload {
+  roomId: string
+  level: number
+  epoch: number
+  bubbleId: string
+  kind: BoostKind
+}
+
+export interface BoostUpdatePayload {
+  level: number
+  epoch: number
+  bubbleId: string
+  kind: BoostKind
+  lightRadiusBonus: number
+  speedBoostEndsAt: number
+}
+
+export interface EnemyStatePayload {
+  roomId: string
+  level: number
+  epoch: number
+  enemies: EnemyNetState[]
 }
 
 export interface PlayerTransformPayload {
@@ -126,6 +316,24 @@ export interface ClientToServerEvents {
   playerTransform: (payload: PlayerTransformPayload) => void
   levelComplete: (payload: LevelCompletePayload) => void
   leaveRoom: () => void
+  // -- Общий мир копания (уровни 0/1), см. секцию RoomLevelState выше --
+  /** "Дай мне текущее состояние level 0/1 комнаты, а если его ещё нет —
+   * создай (с новым seed) прямо сейчас": первый вызов после joinRoom с
+   * levelState === null, либо повторный при рассинхроне. */
+  ensureLevel: (payload: EnsureLevelPayload, ack: (response: EnsureLevelAck) => void) => void
+  /** Игрок дошёл до двери с полным набором звёзд команды — переводит ВСЮ
+   * комнату на следующий уровень разом (см. LevelAdvancedPayload). */
+  advanceLevel: (payload: AdvanceLevelPayload, ack: (response: EnsureLevelAck) => void) => void
+  /** Игрок погиб — перезапускает общий уровень (новый seed, новая эпоха) для
+   * ВСЕЙ комнаты, иначе карты игроков тут же разошлись бы. */
+  roomRestart: (payload: RoomRestartRequestPayload) => void
+  wallHit: (payload: WallHitPayload) => void
+  starPickup: (payload: StarPickupPayload) => void
+  lightActivate: (payload: LightActivatePayload) => void
+  boostActivate: (payload: BoostActivatePayload) => void
+  /** Периодически шлёт только "хост" комнаты (см. game/network — первый по
+   * RoomInfo.players) — сервер лишь ретранслирует остальным, не пересчитывает. */
+  enemyState: (payload: EnemyStatePayload) => void
 }
 
 export interface ServerToClientEvents {
@@ -136,6 +344,13 @@ export interface ServerToClientEvents {
   playerJoined: (payload: PlayerJoinedPayload) => void
   playerLeft: (payload: PlayerLeftPayload) => void
   errorMessage: (message: string) => void
+  levelAdvanced: (payload: LevelAdvancedPayload) => void
+  roomRestarted: (payload: RoomRestartPayload) => void
+  wallUpdated: (payload: WallUpdatedPayload) => void
+  starCollected: (payload: StarCollectedPayload) => void
+  lightUpdate: (payload: LightUpdatePayload) => void
+  boostUpdate: (payload: BoostUpdatePayload) => void
+  enemyState: (payload: EnemyStatePayload) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +373,28 @@ export const PLAYER_SPEED_BY_FORM: Record<PlayerForm, number> = {
   worm: 150,
   ant: 250,
 }
+
+// ---------------------------------------------------------------------------
+// Тайминги/баланс общих (шарящихся между игроками комнаты) эффектов уровня —
+// сервер авторитетно считает МОМЕНТ ОКОНЧАНИЯ по этим длительностям (см.
+// RoomLevelState.lightEndsAt/speedBoostEndsAt), а не сами длительности,
+// поэтому таймеры не расходятся между клиентами даже при задержке сети.
+// Вынесены сюда (а не только в game/config/GameConfig.ts), потому что нужны
+// и серверу (у него нет доступа к клиентским game/config/*) — GameConfig.ts
+// переиспользует эти же константы для single player, чтобы баланс не разъехался.
+// ---------------------------------------------------------------------------
+
+/** Сколько миллисекунд действует факел-выключатель (карта видна без тумана). */
+export const SHARED_LIGHT_DURATION_MS = 60_000
+
+/** Сколько миллисекунд действует пузырёк скорости. */
+export const SHARED_SPEED_BOOST_DURATION_MS = 15_000
+
+/** Во сколько раз пузырёк скорости ускоряет игрока, пока действует. */
+export const SHARED_SPEED_BOOST_MULTIPLIER = 2
+
+/** Постоянная добавка к радиусу света от одного пузырька света. */
+export const SHARED_LIGHT_RADIUS_BONUS = 45
 
 /**
  * Один шаг интеграции позиции игрока по вводу — чистая функция без побочных

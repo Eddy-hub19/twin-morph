@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="70" viewBox="-8 -16 108 82">
+  <g transform="translate(0,0)">
+  <!-- Задние (толчковые/плавательные) лапы -->
+  <g stroke="#2f4a1d" stroke-width="2.4" stroke-linecap="round" fill="none">
+    <path d="M20,38 L4,46" />
+    <path d="M20,38 L2,50" />
+    <path d="M20,38 L4,54" />
+  </g>
+  <path d="M20,38 L4,46 L-4,42 M4,46 L-2,48 M4,46 L-2,52" stroke="#2f4a1d" stroke-width="1.6" stroke-linecap="round" fill="none" />
+
+  <!-- Передние лапки -->
+  <g stroke="#2f4a1d" stroke-width="2.2" stroke-linecap="round" fill="none">
+    <path d="M60,44 L67,54" />
+    <path d="M67,54 L71,58" />
+    <path d="M67,54 L65,59" />
+    <path d="M67,54 L61,58" />
+  </g>
+
+  <!-- Тело -->
+  <ellipse cx="42" cy="30" rx="30" ry="19" fill="#6b9c46" stroke="#33481f" stroke-width="2.4" />
+
+  <!-- Брюшко -->
+  <ellipse cx="37" cy="38" rx="19" ry="9" fill="#d7edac" opacity="0.75" />
+
+  <!-- Пятна -->
+  <ellipse cx="26" cy="20" rx="5" ry="3.5" fill="#4d7a30" opacity="0.6" />
+  <ellipse cx="48" cy="16" rx="4.5" ry="3" fill="#4d7a30" opacity="0.6" />
+  <ellipse cx="34" cy="34" rx="4" ry="2.6" fill="#4d7a30" opacity="0.45" />
+
+  <!-- Глаза (бугорки на макушке, ближе к "лицевой" правой стороне) -->
+  <circle cx="58" cy="12" r="8" fill="#6b9c46" stroke="#33481f" stroke-width="2" />
+  <circle cx="72" cy="14" r="7.5" fill="#6b9c46" stroke="#33481f" stroke-width="2" />
+  <circle cx="59" cy="11" r="3.6" fill="#151d0d" />
+  <circle cx="73" cy="13" r="3.4" fill="#151d0d" />
+  <circle cx="57.5" cy="9.5" r="1.2" fill="#ffffff" />
+  <circle cx="71.5" cy="11.5" r="1.1" fill="#ffffff" />
+
+  <!-- Улыбка -->
+  <path d="M54,26 Q66,32 78,24" stroke="#33481f" stroke-width="2" fill="none" stroke-linecap="round" />
+  </g>
+</svg>

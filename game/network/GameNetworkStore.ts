@@ -4,12 +4,21 @@ import {
   SERVER_TICK_RATE,
   createInitialPlayerState,
   stepPlayerState,
+  type BoostKind,
+  type BoostUpdatePayload,
+  type EnemyNetState,
   type GameMode,
   type GameStateSnapshot,
+  type LevelAdvancedPayload,
+  type LightUpdatePayload,
   type PlayerForm,
   type PlayerInput,
   type PlayerState,
   type RoomInfo,
+  type RoomLevelState,
+  type RoomRestartPayload,
+  type StarCollectedPayload,
+  type WallUpdatedPayload,
 } from "@/shared/game-protocol"
 
 export type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected"
@@ -78,6 +87,26 @@ export class GameNetworkStore {
   private lastInputSentAt = 0
   private readonly minInputIntervalMs = 1000 / SERVER_TICK_RATE
   private lastPoseSentAt = 0
+
+  // Общий мир копания (уровни 0/1) — см. shared/game-protocol.ts:
+  // RoomLevelState. epoch/teamStars/levelState приходят сначала в JoinRoomAck
+  // (полный снапшот для нового/переподключившегося игрока), дальше держатся
+  // в актуальном состоянии широковещательными событиями сервера. Очереди
+  // (wallUpdates и т.п.) — тот же принцип "накопили за кадр, GameScene раз в
+  // кадр вычерпывает" (drain*), что и remoteBuffers выше: явная защита от
+  // повторной обработки одного и того же события.
+  private epoch = 0
+  private teamStars = 0
+  private levelState: RoomLevelState | null = null
+  private wallUpdateQueue: WallUpdatedPayload[] = []
+  private starCollectedQueue: StarCollectedPayload[] = []
+  private lightUpdateQueue: LightUpdatePayload[] = []
+  private boostUpdateQueue: BoostUpdatePayload[] = []
+  private pendingLevelAdvanced: LevelAdvancedPayload | null = null
+  private pendingRoomRestart: RoomRestartPayload | null = null
+  private latestEnemyState: EnemyNetState[] | null = null
+  private lastEnemyStateSentAt = 0
+  private readonly minEnemyStateIntervalMs = 150
 
   private listeners = new Set<Listener>()
   private cachedSnapshot: NetworkSnapshot = this.computeSnapshot()
@@ -167,6 +196,13 @@ export class GameNetworkStore {
         // локального состояния до этого момента.
         this.localState = this.localState ?? createInitialPlayerState(ack.playerId, "worm")
         this.connectionStatus = "connected"
+
+        // Общий мир копания — полный снапшот комнаты прямо в ack, см.
+        // комментарий у JoinRoomAck.levelState в shared/game-protocol.ts.
+        this.epoch = ack.epoch ?? 0
+        this.teamStars = ack.teamStars ?? 0
+        this.levelState = ack.levelState ?? null
+
         this.notify()
         resolve(ack.room)
       })
@@ -214,6 +250,35 @@ export class GameNetworkStore {
         buffer.prev = { ...buffer.prev, form: payload.form }
         buffer.next = { ...buffer.next, form: payload.form }
       }
+    })
+
+    // Общий мир копания — см. shared/game-protocol.ts. Широковещательные
+    // события (сервер — источник истины) просто копятся в очередях/полях,
+    // GameScene вычерпывает их раз в кадр (drain*) — так же, как остальной
+    // код этого класса уже делает с remoteBuffers/pendingInputs.
+    socket.on("wallUpdated", (payload) => this.wallUpdateQueue.push(payload))
+    socket.on("starCollected", (payload) => {
+      this.teamStars = payload.teamStars
+      this.starCollectedQueue.push(payload)
+    })
+    socket.on("lightUpdate", (payload) => this.lightUpdateQueue.push(payload))
+    socket.on("boostUpdate", (payload) => this.boostUpdateQueue.push(payload))
+    socket.on("enemyState", (payload) => {
+      this.latestEnemyState = payload.enemies
+    })
+    socket.on("levelAdvanced", (payload) => {
+      this.levelState = payload.levelState
+      this.teamStars = payload.teamStars
+      this.epoch = payload.epoch
+      this.pendingLevelAdvanced = payload
+      this.notify()
+    })
+    socket.on("roomRestarted", (payload) => {
+      this.levelState = payload.levelState
+      this.teamStars = payload.teamStars
+      this.epoch = payload.epoch
+      this.pendingRoomRestart = payload
+      this.notify()
     })
   }
 
@@ -367,6 +432,164 @@ export class GameNetworkStore {
   }
 
   // -------------------------------------------------------------------------
+  // Общий мир копания (уровни 0/1) — см. shared/game-protocol.ts. В single
+  // player весь этот раздел не задействуется: GameScene различает режим сам
+  // (mode !== "coop") и генерирует уровень локально со случайным seed, как и
+  // раньше — этот класс лишь не мешает, возвращая null/пропуская отправку.
+  // -------------------------------------------------------------------------
+
+  public getEpoch(): number {
+    return this.epoch
+  }
+
+  public getTeamStars(): number {
+    return this.teamStars
+  }
+
+  public getLevelState(): RoomLevelState | null {
+    return this.levelState
+  }
+
+  /** "Хост" комнаты — первый по RoomInfo.players (общий для обоих клиентов
+   * порядок, задаётся сервером) — только он реально симулирует врагов/стража
+   * и шлёт их состояние остальным (см. sendEnemyState). В single player
+   * всегда true (там нет "остальных", и семантика не важна). */
+  public isHost(): boolean {
+    if (this.mode !== "coop") return true
+    const players = this.roomInfo?.players ?? []
+    return players[0]?.playerId === this.localPlayerId
+  }
+
+  /** "Дай текущее состояние level N, а если его ещё нет — заведи новое (с
+   * ЭТИМИ width/height — свой digLevelWidth()/Height(), см. GameScene)" —
+   * первый вызов после входа в co-op (levelState из join ещё null) или при
+   * ручной пересинхронизации. Возвращает null в single player. */
+  public async ensureLevel(level: number, width: number, height: number): Promise<RoomLevelState | null> {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return null
+
+    return new Promise((resolve) => {
+      this.socket!.emit("ensureLevel", { roomId: this.roomInfo!.roomId, level, width, height }, (ack) => {
+        if (!ack.ok || !ack.levelState) {
+          resolve(null)
+          return
+        }
+        this.levelState = ack.levelState
+        this.teamStars = ack.teamStars ?? this.teamStars
+        this.epoch = ack.epoch ?? this.epoch
+        resolve(ack.levelState)
+      })
+    })
+  }
+
+  /** Игрок дошёл до двери с полным общим счётом звёзд — просит сервер
+   * перевести ВСЮ комнату на следующий уровень. Сам переход GameScene
+   * выполняет не отсюда, а из drainLevelAdvanced() — событие приходит
+   * ОБОИМ клиентам одинаково (включая заявителя), это и есть единая точка,
+   * где оба реально генерируют новый уровень. В single player — no-op,
+   * вызывающий код сам делает переход немедленно, без сервера. */
+  public requestAdvanceLevel(fromLevel: number, toLevel: number, width: number, height: number): void {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return
+    this.socket.emit("advanceLevel", { roomId: this.roomInfo.roomId, fromLevel, toLevel, width, height }, () => {
+      // Результат неважен здесь — реальный переход придёт широковещательно
+      // через "levelAdvanced" (см. drainLevelAdvanced), даже самому заявителю.
+    })
+  }
+
+  /** Игрок погиб на общем уровне — просит сервер перезапустить ВСЮ комнату
+   * (иначе карты разошлись бы). Как и с advanceLevel, реальный рестарт
+   * GameScene выполняет из drainRoomRestart() — по широковещательному
+   * событию, а не по этому вызову напрямую. */
+  public requestRoomRestart(width: number, height: number): void {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return
+    this.socket.emit("roomRestart", { roomId: this.roomInfo.roomId, width, height })
+  }
+
+  /** Локальный игрок прогрыз/повредил блок — сообщает остальным в комнате
+   * (сервер хранит это как часть диффа для следующего снапшота). */
+  public reportWallHit(level: number, cellKey: string, hits: number, destroyed: boolean): void {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return
+    this.socket.emit("wallHit", { roomId: this.roomInfo.roomId, level, epoch: this.epoch, cellKey, hits, destroyed })
+  }
+
+  /** Локальный игрок подобрал звезду — сервер проверяет уникальность starId
+   * (анти-даблпик) и, если она ещё не была засчитана, рассылает новый общий
+   * счёт всей комнате (см. drainStarCollected). */
+  public requestStarPickup(level: number, starId: string): void {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return
+    this.socket.emit("starPickup", { roomId: this.roomInfo.roomId, level, epoch: this.epoch, starId })
+  }
+
+  /** Локальный игрок зажёг факел-выключатель — действует на всю комнату. */
+  public requestLightActivate(level: number, switchId: string): void {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return
+    this.socket.emit("lightActivate", { roomId: this.roomInfo.roomId, level, epoch: this.epoch, switchId })
+  }
+
+  /** Локальный игрок подобрал пузырёк (света или скорости) — действует на всю комнату. */
+  public requestBoostActivate(level: number, bubbleId: string, kind: BoostKind): void {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return
+    this.socket.emit("boostActivate", { roomId: this.roomInfo.roomId, level, epoch: this.epoch, bubbleId, kind })
+  }
+
+  /** Только хост комнаты реально шлёт это (см. isHost) — троттлинг тот же
+   * принцип, что и у sendInputThrottled/reportLocalPose. */
+  public sendEnemyState(level: number, enemies: EnemyNetState[]): void {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo || !this.isHost()) return
+
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now()
+    if (now - this.lastEnemyStateSentAt < this.minEnemyStateIntervalMs) return
+
+    this.lastEnemyStateSentAt = now
+    this.socket.emit("enemyState", { roomId: this.roomInfo.roomId, level, epoch: this.epoch, enemies })
+  }
+
+  /** Последнее известное состояние врагов от хоста (для гостя) — null, если
+   * ничего ещё не приходило (например, только что переподключились). */
+  public getLatestEnemyState(): EnemyNetState[] | null {
+    return this.latestEnemyState
+  }
+
+  // Каждый drain* — "накопили за кадр(ы), вычерпали ровно один раз" — явная
+  // защита от повторной обработки одного и того же события, см. комментарий
+  // у полей очередей выше.
+
+  public drainWallUpdates(): WallUpdatedPayload[] {
+    const drained = this.wallUpdateQueue
+    this.wallUpdateQueue = []
+    return drained
+  }
+
+  public drainStarCollected(): StarCollectedPayload[] {
+    const drained = this.starCollectedQueue
+    this.starCollectedQueue = []
+    return drained
+  }
+
+  public drainLightUpdates(): LightUpdatePayload[] {
+    const drained = this.lightUpdateQueue
+    this.lightUpdateQueue = []
+    return drained
+  }
+
+  public drainBoostUpdates(): BoostUpdatePayload[] {
+    const drained = this.boostUpdateQueue
+    this.boostUpdateQueue = []
+    return drained
+  }
+
+  public drainLevelAdvanced(): LevelAdvancedPayload | null {
+    const drained = this.pendingLevelAdvanced
+    this.pendingLevelAdvanced = null
+    return drained
+  }
+
+  public drainRoomRestart(): RoomRestartPayload | null {
+    const drained = this.pendingRoomRestart
+    this.pendingRoomRestart = null
+    return drained
+  }
+
+  // -------------------------------------------------------------------------
   // Завершение
   // -------------------------------------------------------------------------
 
@@ -393,5 +616,16 @@ export class GameNetworkStore {
     this.remoteBuffers.clear()
     this.lastInputSentAt = 0
     this.lastPoseSentAt = 0
+    this.epoch = 0
+    this.teamStars = 0
+    this.levelState = null
+    this.wallUpdateQueue = []
+    this.starCollectedQueue = []
+    this.lightUpdateQueue = []
+    this.boostUpdateQueue = []
+    this.pendingLevelAdvanced = null
+    this.pendingRoomRestart = null
+    this.latestEnemyState = null
+    this.lastEnemyStateSentAt = 0
   }
 }

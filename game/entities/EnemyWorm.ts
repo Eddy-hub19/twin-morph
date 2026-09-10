@@ -2,6 +2,7 @@ import { Assets, Graphics, Sprite, Texture } from "pixi.js"
 import { Entity } from "./Entity"
 import { Star } from "./Star"
 import { Wall, findWallAt } from "./Wall"
+import type { EnemyNetState } from "../../shared/game-protocol"
 import {
   ENEMY_SPEED,
   ENEMY_PROBE_DISTANCE as PROBE_DISTANCE,
@@ -52,6 +53,16 @@ export class EnemyWorm extends Entity {
    */
   public stealCooldown = 0
 
+  /**
+   * Co-op: пока `puppet` false — этот враг ведёт себя как обычно, честно
+   * симулируя свой ИИ локально (так работает "хост" комнаты — первый по
+   * RoomInfo.players — и всегда single player). Если true — update() ничего
+   * не считает сам, а только отрисовывает состояние, присланное хостом (см.
+   * setRemoteState/GameScene.applyEnemyNetState) — то есть ОДИН канонический
+   * набор врагов на комнату, а не свой независимый у каждого клиента.
+   */
+  private puppet = false
+
   constructor(
     x: number,
     y: number,
@@ -59,10 +70,36 @@ export class EnemyWorm extends Entity {
     private areaHeight: number,
     private nestX: number,
     private nestY: number,
+    /** Стабильный id ("enemy:0", "enemy:1", ...) — одинаковый у хоста и
+     * гостя, раз оба спавнят врагов в одном порядке из общего seed. */
+    public readonly remoteId: string,
   ) {
     super()
     this.container.x = x
     this.container.y = y
+  }
+
+  /** Гость применяет состояние, присланное хостом, вместо своего ИИ. */
+  public setRemoteState(state: EnemyNetState): void {
+    this.puppet = true
+    this.container.x = state.x
+    this.container.y = state.y
+    this.container.rotation = state.rotation
+    if (this.carryIcon) this.carryIcon.visible = Boolean(state.carryingStarId)
+  }
+
+  /** Хост собирает своё текущее состояние для рассылки гостю. carriedStar
+   * передаётся отдельно (id), а не самим объектом Star — сети объекты не нужны. */
+  public toNetState(carryingStarId: string | null): EnemyNetState {
+    return {
+      id: this.remoteId,
+      kind: "enemy",
+      x: this.container.x,
+      y: this.container.y,
+      rotation: this.container.rotation,
+      alive: true,
+      carryingStarId,
+    }
   }
 
   public async init(): Promise<void> {
@@ -91,6 +128,13 @@ export class EnemyWorm extends Entity {
 
   public update(deltaTime: number, walls: Wall[] = [], stars: Star[] = []): void {
     if (!this.sprite) {
+      return
+    }
+
+    // Гость комнаты не считает ИИ вообще — GameScene двигает эту сущность
+    // напрямую через setRemoteState() каждый раз, когда приходит enemyState
+    // от хоста (см. комментарий у puppet выше).
+    if (this.puppet) {
       return
     }
 

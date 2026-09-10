@@ -9,8 +9,12 @@ import { REVEAL_SWITCH_WIDTH, REVEAL_SWITCH_HEIGHT } from "../config/GameConfig"
  * отличаться от золотых звёзд и голубых пузырьков света.
  */
 export class RevealSwitch extends Entity {
-  constructor(x: number, y: number) {
+  /** Стабильный id ("level:switch") — см. Star.id, тот же принцип; факел один на уровень. */
+  public readonly id: string
+
+  constructor(x: number, y: number, id: string) {
     super()
+    this.id = id
     this.container.x = x
     this.container.y = y
 
