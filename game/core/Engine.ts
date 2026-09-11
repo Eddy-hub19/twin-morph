@@ -11,6 +11,10 @@ export class Engine {
   private scene: Scene | null = null
   public readonly input = new InputManager()
 
+  /** Dev-only FPS-подписчик (см. Game.tsx) — вызывается тем же ticker-колбеком,
+   * что и update(), а не отдельным rAF-циклом. null, если оверлей не включён. */
+  private onFpsSample: ((fps: number) => void) | null = null
+
   constructor(private container: HTMLDivElement) {}
 
   public async initialize(): Promise<void> {
@@ -31,10 +35,45 @@ export class Engine {
     this.container.appendChild(this.app.canvas)
   }
 
+  /** Полностью останавливает движок: снимает ticker-колбек, рвёт слушатели
+   * клавиатуры (InputManager.destroy), уничтожает текущую сцену (Scene.destroy
+   * -> Entity.destroy на всех сущностях) и сам PIXI Application вместе с
+   * канвасом. Текстуры НЕ трогаем (texture: false) — они кешированы через
+   * Assets.load и должны пережить повторный initialize() (следующий mount
+   * компонента/HMR), иначе он либо упадёт, либо будет грузить всё заново. */
+  public destroy(): void {
+    if (!this.app) return
+
+    // Опциональная цепочка — на случай, если destroy() всё же вызовут (или
+    // будет вызван повторно) для Application, у которого init() ещё не
+    // успел довыполниться (тикер/рендерер тогда ещё не существуют); в
+    // норме этого не происходит — вызывающий код (Game.tsx) ждёт реального
+    // завершения initialize(), прежде чем звать destroy().
+    this.app.ticker?.remove(this.update)
+    this.input.destroy()
+    // Явно уничтожаем сцену САМИ (а не полагаемся на children:true у
+    // app.destroy ниже) — иначе PIXI попытался бы рекурсивно уничтожить те
+    // же самые контейнеры/спрайты ДВАЖДЫ (сцена уже уничтожена явно, потом
+    // ещё раз через обход stage.children), что бросает исключение на уже
+    // освобождённых внутренних WebGL-ресурсах.
+    this.scene?.destroy()
+    this.scene = null
+    this.app.destroy(true, { children: false, texture: false })
+    this.app = null
+  }
+
+  /** Dev-only: подписка на сглаженный FPS каждого тика (см. Time.getFps) —
+   * используется только временным debug-оверлеем (Game.tsx), в проде не
+   * вызывается вообще (см. гейт NODE_ENV там же). */
+  public setFpsListener(listener: ((fps: number) => void) | null): void {
+    this.onFpsSample = listener
+  }
+
   private update = (): void => {
     if (!this.app) return
 
     this.time.update(this.app.ticker.deltaMS)
     this.scene?.update(this.time.deltaTime)
+    this.onFpsSample?.(this.time.getFps())
   }
 }

@@ -4,21 +4,26 @@ import {
   SERVER_TICK_RATE,
   createInitialPlayerState,
   stepPlayerState,
+  type BigBranchStatePayload,
   type BoostKind,
   type BoostUpdatePayload,
   type EnemyNetState,
+  type EnsureWaterSegmentAck,
   type GameMode,
   type GameStateSnapshot,
   type LevelAdvancedPayload,
   type LightUpdatePayload,
+  type MaterialUpdatedPayload,
   type PlayerForm,
   type PlayerInput,
   type PlayerState,
   type RoomInfo,
   type RoomLevelState,
   type RoomRestartPayload,
+  type SlotUpdatedPayload,
   type StarCollectedPayload,
   type WallUpdatedPayload,
+  type WaterSegmentState,
 } from "@/shared/game-protocol"
 
 export type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected"
@@ -33,6 +38,15 @@ export interface NetworkSnapshot {
 interface RemoteBufferEntry {
   prev: PlayerState
   next: PlayerState
+  prevAt: number
+  nextAt: number
+}
+
+/** Тот же принцип буферизации, что и у RemoteBufferEntry выше, только per-enemy
+ * (по EnemyNetState.id) — см. enemyBuffers/getInterpolatedEnemyStates. */
+interface EnemyBufferEntry {
+  prev: EnemyNetState
+  next: EnemyNetState
   prevAt: number
   nextAt: number
 }
@@ -75,6 +89,16 @@ export class GameNetworkStore {
   private localState: PlayerState | null = null
 
   private socket: TypedGameSocket | null = null
+  /** Какому именно физическому сокету уже привязаны слушатели (см.
+   * bindSocketListeners) — GameSocket переиспользует один и тот же сокет
+   * между вызовами startCoop()/disconnect() (leave+rejoin комнаты, retry
+   * после ошибки), так что без этой отметки каждый повторный startCoop()
+   * навешивал бы ещё один комплект из ~13 обработчиков поверх старых —
+   * каждое реальное событие (stateSnapshot, wallUpdated...) начинало бы
+   * обрабатываться N раз (не просто лишний CPU, а дублирование записи в
+   * очереди типа wallUpdateQueue). НЕ сбрасывается в reset() — привязка
+   * живёт по жизненному циклу сокета, а не сессии стора. */
+  private listenersBoundFor: TypedGameSocket | null = null
   private hasJoinedBefore = false
   /** roomId, запрошенный при старте co-op (из ссылки-приглашения) — переиспользуется при reconnect. */
   private requestedRoomId: string | undefined
@@ -102,11 +126,26 @@ export class GameNetworkStore {
   private starCollectedQueue: StarCollectedPayload[] = []
   private lightUpdateQueue: LightUpdatePayload[] = []
   private boostUpdateQueue: BoostUpdatePayload[] = []
+  private materialUpdateQueue: MaterialUpdatedPayload[] = []
+  private slotUpdateQueue: SlotUpdatedPayload[] = []
+  private latestBigBranchState: BigBranchStatePayload | null = null
+  /** Номер водного сегмента (уровень 3+), на котором ЭТОТ игрок сам был в
+   * последний раз — из JoinRoomAck.frogProgress, см. shared/game-protocol.ts.
+   * null, если он никогда не доплывал до воды. Только для late-join/reconnect
+   * bootstrap (см. GameScene.startCoopLevel) — сама водная фаза (уровни 3+)
+   * не имеет единого "текущего уровня комнаты", в отличие от levelState выше. */
+  private frogProgress: number | null = null
   private pendingLevelAdvanced: LevelAdvancedPayload | null = null
   private pendingRoomRestart: RoomRestartPayload | null = null
   private latestEnemyState: EnemyNetState[] | null = null
+  /** Буфер (prev/next снапшот + время получения) на каждого врага/стража,
+   * см. getInterpolatedEnemyStates — тот же принцип, что и remoteBuffers
+   * выше для игроков, устраняет ривки/телепортации у гостя между редкими
+   * (раз в minEnemyStateIntervalMs) обновлениями от хоста. */
+  private enemyBuffers = new Map<string, EnemyBufferEntry>()
   private lastEnemyStateSentAt = 0
   private readonly minEnemyStateIntervalMs = 150
+  private lastBigBranchStateSentAt = 0
 
   private listeners = new Set<Listener>()
   private cachedSnapshot: NetworkSnapshot = this.computeSnapshot()
@@ -202,6 +241,7 @@ export class GameNetworkStore {
         this.epoch = ack.epoch ?? 0
         this.teamStars = ack.teamStars ?? 0
         this.levelState = ack.levelState ?? null
+        this.frogProgress = ack.frogProgress ?? null
 
         this.notify()
         resolve(ack.room)
@@ -210,6 +250,11 @@ export class GameNetworkStore {
   }
 
   private bindSocketListeners(socket: TypedGameSocket): void {
+    // Тот же физический сокет уже получил свой комплект обработчиков раньше
+    // (см. комментарий у listenersBoundFor) — не навешиваем ещё один поверх.
+    if (this.listenersBoundFor === socket) return
+    this.listenersBoundFor = socket
+
     socket.on("disconnect", () => {
       this.connectionStatus = "disconnected"
       this.notify()
@@ -263,8 +308,24 @@ export class GameNetworkStore {
     })
     socket.on("lightUpdate", (payload) => this.lightUpdateQueue.push(payload))
     socket.on("boostUpdate", (payload) => this.boostUpdateQueue.push(payload))
+    socket.on("materialUpdated", (payload) => this.materialUpdateQueue.push(payload))
+    socket.on("slotUpdated", (payload) => this.slotUpdateQueue.push(payload))
+    socket.on("bigBranchState", (payload) => {
+      this.latestBigBranchState = payload
+    })
     socket.on("enemyState", (payload) => {
       this.latestEnemyState = payload.enemies
+
+      const now = typeof performance !== "undefined" ? performance.now() : Date.now()
+      for (const state of payload.enemies) {
+        const existing = this.enemyBuffers.get(state.id)
+        this.enemyBuffers.set(state.id, {
+          prev: existing?.next ?? state,
+          next: state,
+          prevAt: existing?.nextAt ?? now,
+          nextAt: now,
+        })
+      }
     })
     socket.on("levelAdvanced", (payload) => {
       this.levelState = payload.levelState
@@ -450,6 +511,13 @@ export class GameNetworkStore {
     return this.levelState
   }
 
+  /** Номер водного сегмента (уровень 3+), на котором ЭТОТ игрок сам был в
+   * последний раз (см. JoinRoomAck.frogProgress) — null, если он никогда не
+   * доплывал до воды. Только для late-join/reconnect bootstrap. */
+  public getFrogProgress(): number | null {
+    return this.frogProgress
+  }
+
   /** "Хост" комнаты — первый по RoomInfo.players (общий для обоих клиентов
    * порядок, задаётся сервером) — только он реально симулирует врагов/стража
    * и шлёт их состояние остальным (см. sendEnemyState). В single player
@@ -477,6 +545,23 @@ export class GameNetworkStore {
         this.teamStars = ack.teamStars ?? this.teamStars
         this.epoch = ack.epoch ?? this.epoch
         resolve(ack.levelState)
+      })
+    })
+  }
+
+  /** Уровни 3+ (жаба, вода) — тот же принцип, что и ensureLevel выше ("первый
+   * доплывший до сегмента N закрепляет его seed/размер, остальные
+   * перевикористовують те самые"), но БЕЗ требования, чтобы вся комната была
+   * на одном номере уровня — прогресс на воде независим у каждого игрока
+   * (см. WaterSegmentState в shared/game-protocol.ts). Возвращает null в
+   * single player (нет сети) — вызывающий код (GameScene) тогда просто
+   * использует собственный window.innerWidth/Height, как и раньше. */
+  public async ensureWaterSegment(level: number, width: number, height: number): Promise<WaterSegmentState | null> {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return null
+
+    return new Promise((resolve) => {
+      this.socket!.emit("ensureWaterSegment", { roomId: this.roomInfo!.roomId, level, width, height }, (ack: EnsureWaterSegmentAck) => {
+        resolve(ack.ok && ack.segment ? ack.segment : null)
       })
     })
   }
@@ -531,6 +616,57 @@ export class GameNetworkStore {
     this.socket.emit("boostActivate", { roomId: this.roomInfo.roomId, level, epoch: this.epoch, bubbleId, kind })
   }
 
+  /** Уровень 2 (пруд/мост): просит клеймить материал за собой — true/false
+   * приходит асинхронно (ack), реальное отображение у ОБОИХ клиентов всё
+   * равно идёт через drainMaterialUpdates (широковещательно, как starPickup).
+   * В single player клейм не нужен (некому конкурировать) — возвращает true
+   * сразу же, без сети. */
+  public async requestMaterialGrab(level: number, materialId: string): Promise<boolean> {
+    if (this.mode !== "coop") return true
+    if (!this.socket || !this.roomInfo) return false
+
+    return new Promise((resolve) => {
+      this.socket!.emit("materialGrab", { roomId: this.roomInfo!.roomId, level, epoch: this.epoch, materialId }, (ack) => resolve(ack.ok))
+    })
+  }
+
+  /** Носитель утонул/выпустил материал — снимает клейм на сервере, чтобы он
+   * снова стал видимым/подбираемым у партнёра. */
+  public requestMaterialRelease(level: number, materialId: string): void {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return
+    this.socket.emit("materialRelease", { roomId: this.roomInfo.roomId, level, epoch: this.epoch, materialId })
+  }
+
+  /** Устанавливает материал, который сейчас несёт локальный игрок, в слот
+   * моста — успех, только если клеймил именно он и слот ещё пуст. */
+  public async requestMaterialInstall(level: number, materialId: string, slotId: string): Promise<boolean> {
+    if (this.mode !== "coop") return true
+    if (!this.socket || !this.roomInfo) return false
+
+    return new Promise((resolve) => {
+      this.socket!.emit("materialInstall", { roomId: this.roomInfo!.roomId, level, epoch: this.epoch, materialId, slotId }, (ack) => resolve(ack.ok))
+    })
+  }
+
+  /** Только хост комнаты реально шлёт это (см. isHost) — тот же троттлинг
+   * (minEnemyStateIntervalMs), что и у sendEnemyState, чтобы не заливать
+   * сокет обновлениями каждый кадр. */
+  public sendBigBranchState(level: number, progress: number, carrierIds: string[]): void {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo || !this.isHost()) return
+
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now()
+    if (now - this.lastBigBranchStateSentAt < this.minEnemyStateIntervalMs) return
+
+    this.lastBigBranchStateSentAt = now
+    this.socket.emit("bigBranchState", { roomId: this.roomInfo.roomId, level, epoch: this.epoch, progress, carrierIds })
+  }
+
+  /** Последнее известное состояние большой ветки от хоста (для гостя) — null,
+   * если ещё ничего не приходило. */
+  public getLatestBigBranchState(): BigBranchStatePayload | null {
+    return this.latestBigBranchState
+  }
+
   /** Только хост комнаты реально шлёт это (см. isHost) — троттлинг тот же
    * принцип, что и у sendInputThrottled/reportLocalPose. */
   public sendEnemyState(level: number, enemies: EnemyNetState[]): void {
@@ -544,9 +680,44 @@ export class GameNetworkStore {
   }
 
   /** Последнее известное состояние врагов от хоста (для гостя) — null, если
-   * ничего ещё не приходило (например, только что переподключились). */
+   * ничего ещё не приходило (например, только что переподключились). Сырое,
+   * без интерполяции — для одноразового наложения при входе/reconnect (см.
+   * GameScene.applyLevelDiff) используйте это, а для рендера КАЖДЫЙ кадр —
+   * getInterpolatedEnemyStates() ниже, иначе враги дёргаются/телепортируются
+   * между редкими обновлениями от хоста. */
   public getLatestEnemyState(): EnemyNetState[] | null {
     return this.latestEnemyState
+  }
+
+  /** Интерполированное между последними двумя снапшотами состояние каждого
+   * врага/стража — тот же принцип, что и getRemotePlayerStates() для
+   * игроков, только окно рендера берётся от интервала рассылки enemyState
+   * (хост шлёт заметно реже тика сервера), а не от SERVER_TICK_MS. Без этого
+   * гость видел бы врага прыгающим в новую точку раз в minEnemyStateIntervalMs
+   * — те самые ривки/телепортации. Поворот интерполируется по кратчайшей
+   * дуге (через atan2(sin,cos)), а не напрямую — иначе враг закручивался бы
+   * "в длинную сторону" при переходе через границу ±π. */
+  public getInterpolatedEnemyStates(): EnemyNetState[] {
+    if (this.enemyBuffers.size === 0) return this.latestEnemyState ?? []
+
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now()
+    const renderTime = now - this.minEnemyStateIntervalMs
+
+    const result: EnemyNetState[] = []
+    for (const buffer of this.enemyBuffers.values()) {
+      const span = buffer.nextAt - buffer.prevAt
+      const t = span > 0 ? Math.min(1, Math.max(0, (renderTime - buffer.prevAt) / span)) : 1
+
+      const rotationDiff = Math.atan2(Math.sin(buffer.next.rotation - buffer.prev.rotation), Math.cos(buffer.next.rotation - buffer.prev.rotation))
+
+      result.push({
+        ...buffer.next,
+        x: buffer.prev.x + (buffer.next.x - buffer.prev.x) * t,
+        y: buffer.prev.y + (buffer.next.y - buffer.prev.y) * t,
+        rotation: buffer.prev.rotation + rotationDiff * t,
+      })
+    }
+    return result
   }
 
   // Каждый drain* — "накопили за кадр(ы), вычерпали ровно один раз" — явная
@@ -574,6 +745,18 @@ export class GameNetworkStore {
   public drainBoostUpdates(): BoostUpdatePayload[] {
     const drained = this.boostUpdateQueue
     this.boostUpdateQueue = []
+    return drained
+  }
+
+  public drainMaterialUpdates(): MaterialUpdatedPayload[] {
+    const drained = this.materialUpdateQueue
+    this.materialUpdateQueue = []
+    return drained
+  }
+
+  public drainSlotUpdates(): SlotUpdatedPayload[] {
+    const drained = this.slotUpdateQueue
+    this.slotUpdateQueue = []
     return drained
   }
 
@@ -619,13 +802,19 @@ export class GameNetworkStore {
     this.epoch = 0
     this.teamStars = 0
     this.levelState = null
+    this.frogProgress = null
     this.wallUpdateQueue = []
     this.starCollectedQueue = []
     this.lightUpdateQueue = []
     this.boostUpdateQueue = []
+    this.materialUpdateQueue = []
+    this.slotUpdateQueue = []
+    this.latestBigBranchState = null
     this.pendingLevelAdvanced = null
     this.pendingRoomRestart = null
     this.latestEnemyState = null
+    this.enemyBuffers.clear()
     this.lastEnemyStateSentAt = 0
+    this.lastBigBranchStateSentAt = 0
   }
 }

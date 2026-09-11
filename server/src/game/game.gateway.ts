@@ -10,14 +10,21 @@ import {
 import type { Server, Socket } from "socket.io"
 import type {
   AdvanceLevelPayload,
+  BigBranchStatePayload,
   BoostActivatePayload,
   EnemyStatePayload,
   EnsureLevelAck,
   EnsureLevelPayload,
+  EnsureWaterSegmentAck,
+  EnsureWaterSegmentPayload,
   JoinRoomAck,
   JoinRoomPayload,
   LevelCompletePayload,
   LightActivatePayload,
+  MaterialGrabAck,
+  MaterialGrabPayload,
+  MaterialInstallAck,
+  MaterialInstallPayload,
   PlayerInput,
   PlayerPosePayload,
   PlayerTransformPayload,
@@ -104,6 +111,7 @@ export class GameGateway implements OnGatewayInit, OnGatewayDisconnect {
       epoch: this.levelState.getEpoch(room.roomId),
       teamStars: this.levelState.getTeamStars(room.roomId),
       levelState: this.levelState.getLevelState(room.roomId),
+      frogProgress: this.gameService.getFrogProgress(player.playerId),
     }
   }
 
@@ -114,6 +122,26 @@ export class GameGateway implements OnGatewayInit, OnGatewayDisconnect {
 
     const levelState = this.levelState.ensureLevel(roomId, payload.level, payload.width, payload.height)
     return { ok: true, levelState, teamStars: this.levelState.getTeamStars(roomId), epoch: this.levelState.getEpoch(roomId) }
+  }
+
+  /** Уровни 3+ (жаба, вода) — см. комментарий у WaterSegmentState. В отличие
+   * от ensureLevel выше, не требует, чтобы вся комната была на одном номере
+   * уровня: прогресс на воде независим у каждого игрока. Заодно запоминаем
+   * "этот игрок сейчас на level" — единственное, что нужно, чтобы отдать
+   * позднему присоединению/реконнекту JoinRoomAck.frogProgress. */
+  @SubscribeMessage("ensureWaterSegment")
+  public handleEnsureWaterSegment(
+    @ConnectedSocket() client: GameSocket,
+    @MessageBody() payload: EnsureWaterSegmentPayload,
+  ): EnsureWaterSegmentAck {
+    const roomId = client.data.roomId
+    const playerId = client.data.playerId
+    if (!roomId || !playerId || roomId !== payload.roomId) return { ok: false }
+
+    const segment = this.levelState.ensureWaterSegment(roomId, payload.level, payload.width, payload.height)
+    this.gameService.setFrogProgress(playerId, payload.level)
+
+    return { ok: true, segment }
   }
 
   /** Игрок дошёл до двери с полным общим счётом звёзд — переводит ВСЮ
@@ -216,6 +244,58 @@ export class GameGateway implements OnGatewayInit, OnGatewayDisconnect {
 
     this.levelState.setEnemies(roomId, payload.level, payload.enemies)
     client.to(roomId).emit("enemyState", payload)
+  }
+
+  /** Уровень 2 (пруд/міст): клеймить матеріал за гравцем — успіх, лише якщо
+   * він ще нічий і не встановлений. Відправник вже застосував це у себе
+   * оптимістично, тож розсилаємо ОБОМ (включно з відправником — єдине
+   * джерело істини) лише при успіху, як starPickup. */
+  @SubscribeMessage("materialGrab")
+  public handleMaterialGrab(@ConnectedSocket() client: GameSocket, @MessageBody() payload: MaterialGrabPayload): MaterialGrabAck {
+    const roomId = client.data.roomId
+    const playerId = client.data.playerId
+    if (!roomId || !playerId || roomId !== payload.roomId) return { ok: false }
+
+    const ok = this.levelState.grabMaterial(roomId, payload.level, payload.materialId, playerId)
+    if (ok) {
+      this.server.to(roomId).emit("materialUpdated", { level: payload.level, epoch: payload.epoch, materialId: payload.materialId, carrierId: playerId })
+    }
+    return { ok }
+  }
+
+  /** Носій утонув/випустив матеріал — знімає клейм і повідомляє решту кімнати,
+   * щоб матеріал знову став видимим на своєму місці спавну. */
+  @SubscribeMessage("materialRelease")
+  public handleMaterialRelease(@ConnectedSocket() client: GameSocket, @MessageBody() payload: MaterialGrabPayload): void {
+    const roomId = client.data.roomId
+    if (!roomId || roomId !== payload.roomId) return
+
+    this.levelState.releaseMaterial(roomId, payload.level, payload.materialId)
+    this.server.to(roomId).emit("materialUpdated", { level: payload.level, epoch: payload.epoch, materialId: payload.materialId, carrierId: null })
+  }
+
+  @SubscribeMessage("materialInstall")
+  public handleMaterialInstall(@ConnectedSocket() client: GameSocket, @MessageBody() payload: MaterialInstallPayload): MaterialInstallAck {
+    const roomId = client.data.roomId
+    const playerId = client.data.playerId
+    if (!roomId || !playerId || roomId !== payload.roomId) return { ok: false }
+
+    const ok = this.levelState.installMaterial(roomId, payload.level, payload.materialId, payload.slotId, playerId)
+    if (ok) {
+      this.server.to(roomId).emit("slotUpdated", { level: payload.level, epoch: payload.epoch, slotId: payload.slotId, materialId: payload.materialId })
+    }
+    return { ok }
+  }
+
+  /** Тільки хост кімнати реально рахує прогрес великої гілки (як enemyState
+   * вище) — сервер лише зберігає останнє значення і ретранслює партнеру. */
+  @SubscribeMessage("bigBranchState")
+  public handleBigBranchState(@ConnectedSocket() client: GameSocket, @MessageBody() payload: BigBranchStatePayload): void {
+    const roomId = client.data.roomId
+    if (!roomId || roomId !== payload.roomId) return
+
+    this.levelState.setBigBranchState(roomId, payload.level, payload.progress, payload.carrierIds)
+    client.to(roomId).emit("bigBranchState", payload)
   }
 
   /** Синхронизация движения — сервер только ЗАПОМИНАЕТ последний ввод, сама

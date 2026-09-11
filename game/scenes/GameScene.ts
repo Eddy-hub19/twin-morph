@@ -7,16 +7,19 @@ import { Bubble } from "../entities/Bubble"
 import { SpeedBubble } from "../entities/SpeedBubble"
 import { RevealSwitch } from "../entities/RevealSwitch"
 import { EnemyWorm } from "../entities/EnemyWorm"
-import { GuardWorm } from "../entities/GuardWorm"
+import { GuardWorm, type GuardTarget } from "../entities/GuardWorm"
 import { Nest } from "../entities/Nest"
 import { Ant } from "../entities/Ant"
 import { Frog } from "../entities/Frog"
 import { SaveButton } from "../entities/SaveButton"
 import { LevelDoorMarker } from "../entities/LevelDoorMarker"
-import { Leaf } from "../entities/Leaf"
-import { Puddle } from "../entities/Puddle"
 import { Sky } from "../entities/Sky"
 import { Water } from "../entities/Water"
+import { Pond } from "../entities/Pond"
+import { Material, type MaterialKind } from "../entities/Material"
+import { BridgeSlot } from "../entities/BridgeSlot"
+import { BigBranch } from "../entities/BigBranch"
+import { Checkpoint } from "../entities/Checkpoint"
 import { GameNetworkStore } from "../network/GameNetworkStore"
 import type { InputManager } from "../input/InputManager"
 import type { EnemyNetState, LevelAdvancedPayload, PlayerForm, PlayerState, RoomLevelState, RoomRestartPayload } from "../../shared/game-protocol"
@@ -58,10 +61,13 @@ import {
   NEST_SCATTER_RANGE,
   STEAL_COOLDOWN_AFTER_DROP,
   ENEMY_NEST_SPAWN_RADIUS,
-  LEVEL3_PUDDLE_COUNT,
-  LEVEL3_LEAF_COUNT,
-  PUDDLE_WIDTH,
-  PUDDLE_HEIGHT,
+  POND_START_RATIO,
+  POND_WIDTH_RATIO,
+  POND_HEIGHT,
+  BRIDGE_SLOT_COUNT,
+  POND_MATERIAL_COUNT,
+  MATERIAL_SIZE,
+  POND_DROWN_GRACE,
   FROG_FOCUS_ZOOM_SCALE,
   FROG_EDGE_MARGIN,
   PARTNER_ARROW_MARGIN,
@@ -89,13 +95,35 @@ export class GameScene extends Scene {
   private activePlayer!: any
   private deathTimer = 0
 
+  /** true после Scene.destroy() (см. onDestroy ниже) — нужен исключительно
+   * для того, чтобы прервать уже запущенные асинхронные цепочки (startCoopLevel/
+   * startCoopFrogLevel/prepareWaterSegment, все — await сети) ПОСЛЕ того, как
+   * сцену уже уничтожили (например, React StrictMode синхронно
+   * размонтирует-и-тут-же-монтирует заново в dev, а initialize()/сетевые
+   * await ещё не успели резолвиться). Без этой проверки такая цепочка
+   * продолжает выполняться уже ПОСЛЕ Engine.destroy() и падает, пытаясь
+   * тронуть уже уничтоженные PIXI-объекты (например, this.fogSprite.texture,
+   * которая после destroy() становится null, хотя сам fogSprite ещё
+   * существует как JS-объект). */
+  private destroyed = false
+
+  protected onDestroy(): void {
+    this.destroyed = true
+  }
+
   // Co-op: напарник — точно такой же Worm/Ant, что и локальный игрок (не
   // отдельный "призрак"-класс), просто его позицией управляет не InputManager,
   // а сетевой снапшот (см. syncNetwork/GameNetworkStore.getRemotePlayerStates).
   // В single player этот стор всегда в режиме "solo", и вся секция ниже —
   // no-op (см. syncNetwork: ранний return, если mode !== "coop").
   private readonly network = GameNetworkStore.getInstance()
-  private readonly remoteEntities = new Map<string, { entity: Worm | Ant; form: PlayerForm }>()
+  private readonly remoteEntities = new Map<string, { entity: Worm | Ant | Frog; form: PlayerForm }>()
+  /** network.isHost() на прошлом кадре — null, пока ещё ни разу не
+   * замерялось (сразу после входа в комнату). Нужно только чтобы поймать
+   * МОМЕНТ перехода false -> true (прежний хост вышел, мы стали первым по
+   * RoomInfo.players) и один раз передать симуляцию врагов себе — см.
+   * processSharedLevelEvents. */
+  private wasHost: boolean | null = null
   // "Пустой" InputManager для сущностей напарника — их update() мы вообще не
   // вызываем (двигаем через setRemotePosition), но конструкторы Worm/Ant
   // требуют объект с этим интерфейсом; настоящий InputManager вешал бы
@@ -159,9 +187,45 @@ export class GameScene extends Scene {
   private partnerArrowAngle = 0
   private partnerArrowX = 0
   private partnerArrowY = 0
-  // Сколько кусочков листа муравей несёт с собой — тратятся по одному на
-  // каждую лужу, чтобы навести через неё мостик (см. Puddle/Leaf, уровень 3).
-  private carriedLeaves = 0
+  // Уровень 3 (индекс 2) — пруд/мост: id и вид материала, который СЕЙЧАС
+  // несёт активный игрок в щелепах (null — ничего не несёт). Устанавливается/
+  // сбрасывается вместе с Ant.setCarriedMaterial() — см. tryGrabMaterial/
+  // tryInstallMaterial/releaseCarriedMaterial в update().
+  private carriedMaterialId: string | null = null
+  private carriedMaterialKind: MaterialKind | null = null
+  // Сколько секунд подряд муравей уже касается пруда без моста под ногами —
+  // см. POND_DROWN_GRACE: реальное утопление срабатывает не в первый же
+  // кадр касания, а после этой небольшой отсрочки (см. update()).
+  private pondUnsafeTimer = 0
+  // Последняя точка (мировые координаты), с которой респавнится муравей
+  // после утопления на уровне 3 — не рестартит весь уровень/комнату (см.
+  // respawnAntAtCheckpoint), обновляется каждым касанием Checkpoint.
+  private lastCheckpointX = 0
+  private lastCheckpointY = 0
+  // Ширина/высота уровня 3 (пруд), общая для комнаты — тот же принцип, что и
+  // roomLevelWidth/Height у уровней 0/1 (см. комментарий там), но отдельное
+  // поле: уровни 2+ используют фиксированный шаг window.innerWidth на КАЖДЫЙ
+  // переход между сегментами (см. update()), а roomLevelWidth/Height — это
+  // совсем другой (увеличенный под подземное копание) размер, мешать их
+  // нельзя. 0 — ещё не согласовано с сервером (co-op) — тогда generateNextLevel
+  // сама подставляет window.innerWidth/Height по умолчанию.
+  private pondLevelWidth = 0
+  private pondLevelHeight = 0
+
+  // Уровни 3+ (жаба, вода) — тот же принцип, что и pondLevelWidth/Height
+  // выше, только прогресс на воде независим у каждого игрока (нет единой
+  // "двери", которую нужно пройти обоим сразу — см. shared/game-protocol.ts
+  // WaterSegmentState): каждый клиент сам просит канонический размер/seed
+  // очередного сегмента у сервера, когда до него доплывает (см.
+  // prepareWaterSegment). 0 — ещё не согласовано (co-op) или single player —
+  // тогда generateNextLevel подставляет window.innerWidth/Height, как и раньше.
+  private waterLevelWidth = 0
+  private waterLevelHeight = 0
+  /** true, пока идёт (единственный) запрос ensureWaterSegment для очередного
+   * сегмента — тот же принцип, что и pendingAdvanceLevel, только это не
+   * ожидание широковещательного события (партнёр может быть на совсем
+   * другом сегменте), а просто свой собственный round-trip до сервера. */
+  private pendingWaterSegment = false
 
   // Туман войны: вокруг червя — светлый круг, дальше — темнота. Копаем вслепую.
   private fogContainer = new Container()
@@ -176,8 +240,9 @@ export class GameScene extends Scene {
   private readonly revealDuration = REVEAL_DURATION
   private revealTimer = 0
 
-  // Пузырёк скорости: подобрал — на SPEED_BOOST_DURATION секунд вдвое
-  // быстрее ходишь. speedText виден только пока действует (как revealText).
+  // Пузырёк скорости: подобрал — на SPEED_BOOST_DURATION секунд
+  // в SPEED_BOOST_MULTIPLIER раз быстрее ходишь. speedText виден только
+  // пока действует (как revealText).
   private speedBoostTimer = 0
   private speedText?: Text
 
@@ -228,12 +293,14 @@ export class GameScene extends Scene {
     this.metaTimer = 0
     this.collectedStars = 0
     this.totalStars = 0
-    this.carriedLeaves = 0
+    this.carriedMaterialId = null
+    this.carriedMaterialKind = null
     this.lightRadius = this.baseLightRadius
     this.revealTimer = 0
     this.speedBoostTimer = 0
     this.pendingAdvanceLevel = false
     this.pendingRoomRestart = false
+    this.pendingWaterSegment = false
     this.lastCarriedStarByEnemy.clear()
     // Текст факела-выключателя переживал рестарт уровня: revealTimer тут
     // выше уже честно обнулён, но сам HUD-текст (тот же Text-объект, что и
@@ -325,12 +392,29 @@ export class GameScene extends Scene {
    * onCreate() — single player (см. выше) целиком синхронный, как и раньше.
    */
   private async startCoopLevel(): Promise<void> {
+    // Late-join/reconnect, когда МЫ САМИ (по своему playerId, см.
+    // JoinRoomAck.frogProgress) уже доплывали до воды — сразу жаба на
+    // актуальном сегменте, минуя кат-сцену метаморфозы и всю диг/пруд-фазу
+    // целиком (тот же принцип, что и loadSavedLevel() в single player —
+    // прыжок сразу на сохранённый уровень без повторного прохождения пути).
+    // Уровни 0/1/2 всегда лок-степ (см. RoomLevelState) — если МЫ уже были
+    // на воде, значит их мы уже честно прошли, повторно проходить незачем.
+    const frogProgress = this.network.getFrogProgress()
+    if (frogProgress !== null && frogProgress >= 3) {
+      await this.startCoopFrogLevel(frogProgress)
+      return
+    }
+    // Сцену успели уничтожить, пока мы ждали сеть выше (см. onDestroy) —
+    // дальше трогать PIXI-объекты уже небезопасно, прерываемся.
+    if (this.destroyed) return
+
     this.currentLevelXOffset = 0
     this.worldContainer.position.set(0, 0)
 
     let levelState = this.network.getLevelState()
     if (!levelState) {
       levelState = await this.network.ensureLevel(0, this.digLevelWidth(), this.digLevelHeight())
+      if (this.destroyed) return
     }
 
     if (!levelState) {
@@ -351,14 +435,22 @@ export class GameScene extends Scene {
 
     this.prepareRoomLevel(levelState, this.network.getEpoch())
     this.currentLevelYOffset = this.levelIndex >= 1 ? -this.roomLevelHeight : 0
+    // Late-joiner на уровне 2 должен генерировать пруд/мост на ТОЙ ЖЕ
+    // абсолютной X, что и партнёр, который дошёл туда пешком (тот копит
+    // currentLevelXOffset по window.innerWidth за каждый пройденный
+    // горизонтальный сегмент, см. переход 1->2 в update()) — иначе пруд,
+    // слоты и материалы окажутся у двух клиентов в разных мировых
+    // координатах, хотя id и seed совпадают. Та же формула, что и в
+    // single-player "startLevel >= 1" ветке onCreate() выше.
+    this.currentLevelXOffset = this.levelIndex >= 1 ? (this.levelIndex - 1) * window.innerWidth : 0
 
     if (this.levelIndex >= 1) {
-      // Late-joiner застал партнёра уже на уровне 1 — сразу муравей на линии
-      // травы, как и при обычном локальном "startLevel >= 1" (см. выше).
-      this.generateNextLevel(0, this.currentLevelYOffset, this.levelIndex)
+      // Late-joiner застал партнёра уже на уровне 1/2 — сразу муравей на
+      // линии травы, как и при обычном локальном "startLevel >= 1" (см. выше).
+      this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
       this.applyLevelDiff(levelState)
 
-      const antX = window.innerWidth / 2
+      const antX = this.currentLevelXOffset + window.innerWidth / 2
       const antY = this.currentLevelYOffset + this.grassLineY - 6
       const ant = new Ant(this.input, antX, antY)
       this.activePlayer = ant
@@ -372,6 +464,45 @@ export class GameScene extends Scene {
       this.applyLevelDiff(levelState)
       this.spawnWormAtLevelStart()
     }
+  }
+
+  /**
+   * Late-join/reconnect прямо на воду (level >= 3) — см. вызов в
+   * startCoopLevel() выше. Диг-фазу (уровни 0/1/2) мы уже честно прошли
+   * раньше (иначе не оказались бы жабой), генерировать её заново незачем —
+   * сразу узнаём канонический сегмент level у сервера и спавним жабу на нём,
+   * без кат-сцены метаморфозы (тот же принцип, что и у "startLevel >= 1" в
+   * single player onCreate() — прыжок сразу на сохранённый прогресс).
+   *
+   * roomLevelHeight (для Y-смещения между диг-фазой и поверхностью) сервер
+   * к этому моменту уже мог "забыть" (RoomLevelState — один слот на комнату,
+   * перезаписывается при каждом advance, а мы могли уйти на воду задолго до
+   * этого реконнекта) — используем собственный digLevelHeight() как разумное
+   * приближение, тот же фолбэк, что и в ветке "сеть подвела" чуть выше.
+   */
+  private async startCoopFrogLevel(level: number): Promise<void> {
+    this.roomLevelHeight = this.digLevelHeight()
+    this.currentLevelYOffset = -this.roomLevelHeight
+
+    await this.prepareWaterSegment(level)
+    if (this.destroyed) return
+
+    // Та же формула, что и у late-join на уровень 1/2 выше (свой собственный
+    // viewport, а не канонический waterLevelWidth — см. комментарий там).
+    this.currentLevelXOffset = (level - 1) * window.innerWidth
+    this.levelIndex = level
+
+    this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
+
+    const frogY = this.currentLevelYOffset + window.innerHeight / 2
+    const frogX = this.currentLevelXOffset + 60
+    const frog = new Frog(this.input, frogX, frogY)
+    this.activePlayer = frog
+    this.addEntity(frog)
+
+    this.worldContainer.scale.set(this.frogFocusZoomScale)
+    this.worldContainer.pivot.set(frogX, frogY)
+    this.worldContainer.position.set(window.innerWidth / 2, window.innerHeight / 2)
   }
 
   /** Общая часть старта уровня 0 (co-op и сетевой фолбэк выше) — ставит
@@ -396,10 +527,63 @@ export class GameScene extends Scene {
    * ровно те размеры, из которых уровень уже сгенерирован у партнёра. */
   private prepareRoomLevel(levelState: RoomLevelState, epoch: number): void {
     this.rng = createRng(levelState.seed)
-    this.roomLevelWidth = levelState.width
-    this.roomLevelHeight = levelState.height
+    if (levelState.level <= 1) {
+      this.roomLevelWidth = levelState.width
+      this.roomLevelHeight = levelState.height
+    } else if (levelState.level === 2) {
+      // Отдельные поля — см. комментарий у pondLevelWidth/Height выше:
+      // размер уровня 2 не связан с увеличенным digLevelWidth/Height 0/1.
+      this.pondLevelWidth = levelState.width
+      this.pondLevelHeight = levelState.height
+    }
     this.roomEpoch = epoch
     this.levelIndex = levelState.level
+  }
+
+  /**
+   * Co-op: узнаёт у сервера канонический seed/размер водного сегмента level
+   * (см. shared/game-protocol.ts WaterSegmentState) — первый из клиентов,
+   * кто до него доплыл, закрепляет их, второй просто получает готовые (тот
+   * же принцип, что и ensureLevel/prepareRoomLevel, но БЕЗ единой "двери":
+   * прогресс на воде независим у каждого игрока, см. GameNetworkStore.
+   * ensureWaterSegment). В single player — мгновенный no-op (сети нет),
+   * waterLevelWidth/Height остаются 0, и generateNextLevel сама подставляет
+   * window.innerWidth/Height — ноль изменений поведения соло.
+   */
+  private async prepareWaterSegment(level: number): Promise<void> {
+    if (this.network.getSnapshot().mode !== "coop") return
+
+    const segment = await this.network.ensureWaterSegment(level, this.waterLevelWidth || window.innerWidth, this.waterLevelHeight || window.innerHeight)
+    if (!segment) return
+
+    this.waterLevelWidth = segment.width
+    this.waterLevelHeight = segment.height
+    this.rng = createRng(segment.seed)
+  }
+
+  /**
+   * Общая часть перехода на следующий водный сегмент (level -> targetLevel) —
+   * тот же приём смены сегмента, что и у муравья/уровня 1->2 (см. update()):
+   * X-смещение на ширину экрана, чистка сущностей позади, генерация нового
+   * куска. Вызывается и мгновенно (single player/повторный переход, если
+   * канонический сегмент уже известен), и из колбэка prepareWaterSegment()
+   * в co-op (см. вызовы ниже).
+   */
+  private advanceWaterSegment(targetLevel: number): void {
+    this.levelIndex = targetLevel
+    this.currentLevelXOffset += window.innerWidth
+
+    const safeXBound = this.currentLevelXOffset - window.innerWidth * 2
+    this.entities = this.entities.filter((entity) => {
+      if (entity !== this.activePlayer && entity.container.x < safeXBound) {
+        this.worldContainer.removeChild(entity.container)
+        return false
+      }
+      return true
+    })
+
+    this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
+    this.worldContainer.addChild(this.activePlayer.container)
   }
 
   /**
@@ -442,7 +626,178 @@ export class GameScene extends Scene {
       this.applyEnemyNetStates(levelState.enemies)
     }
 
+    if (levelState.level === 2) {
+      this.applyPondLevelDiff(levelState)
+    }
+
     this.updateHud()
+  }
+
+  /** Часть applyLevelDiff, специфичная для уровня 3 (индекс 2, пруд/мост) —
+   * см. комментарий у RoomLevelState.materialCarriers/bridgeSlots/bigBranch. */
+  private applyPondLevelDiff(levelState: RoomLevelState): void {
+    const materials = this.entities.filter((e): e is Material => e instanceof Material)
+    const localPlayerId = this.network.getSnapshot().localPlayerId
+
+    for (const [materialId, carrierId] of Object.entries(levelState.materialCarriers)) {
+      const material = materials.find((m) => m.id === materialId)
+      if (material) material.container.visible = false
+
+      if (carrierId === localPlayerId) {
+        this.carriedMaterialId = materialId
+        this.carriedMaterialKind = material?.kind ?? null
+        if (this.activePlayer instanceof Ant) this.activePlayer.setCarriedMaterial(this.carriedMaterialKind)
+      }
+    }
+
+    const slots = this.entities.filter((e): e is BridgeSlot => e instanceof BridgeSlot)
+    for (const [slotId, materialId] of Object.entries(levelState.bridgeSlots)) {
+      const slot = slots.find((s) => s.id === slotId)
+      const material = materials.find((m) => m.id === materialId)
+      if (slot && material && !slot.isInstalled) {
+        slot.install(materialId, material.kind)
+        material.container.visible = false
+      }
+    }
+
+    const bigBranch = this.entities.find((e): e is BigBranch => e instanceof BigBranch)
+    if (bigBranch) {
+      // Хост сам продолжает считать прогресс локально (tick() в update()) —
+      // навязывать ему setRemoteState нельзя, иначе он навсегда станет
+      // "куклой" и перестанет симулировать собственную же ветку.
+      if (!this.network.isHost()) {
+        bigBranch.setRemoteState(levelState.bigBranch.progress)
+      }
+
+      if (levelState.bigBranch.progress >= 1 && !bigBranch.installed) {
+        bigBranch.markInstalled()
+        const finalSlot = slots[slots.length - 1]
+        if (finalSlot && !finalSlot.isInstalled) finalSlot.install("bigBranch", "bigBranch")
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Уровень 3 (индекс 2) — пруд/мост: подбор/установка материала, утопление,
+  // респавн на чекпоинте. См. RoomLevelState.materialCarriers/bridgeSlots/
+  // bigBranch и GameNetworkStore.requestMaterialGrab/Install/Release.
+  // -------------------------------------------------------------------------
+
+  /** Пытается подобрать материал — в single player сразу локально, в co-op
+   * просит сервер клеймить (результат применится широковещательно через
+   * drainMaterialUpdates/applyMaterialGrabbed, включая нас самих). */
+  private tryGrabMaterial(material: Material): void {
+    if (this.carriedMaterialKind) return
+
+    if (this.network.getSnapshot().mode === "coop") {
+      void this.network.requestMaterialGrab(this.levelIndex, material.id)
+      return
+    }
+
+    this.applyMaterialGrabbed(material.id, true)
+  }
+
+  /** Применяет "материал подобран" — и для своего клейма (isLocal), и для
+   * чужого (просто прячет материал, ничего в своём состоянии не меняет). */
+  private applyMaterialGrabbed(materialId: string, isLocal: boolean): void {
+    const material = this.entities.find((e): e is Material => e instanceof Material && e.id === materialId)
+    if (!material || !material.container.visible) return // уже подобран/установлен кем-то
+
+    material.container.visible = false
+
+    if (isLocal) {
+      this.carriedMaterialId = materialId
+      this.carriedMaterialKind = material.kind
+      if (this.activePlayer instanceof Ant) this.activePlayer.setCarriedMaterial(material.kind)
+      this.updateHud()
+    }
+  }
+
+  /** Материал снова свободен (утонул носитель) — возвращаем его видимым на
+   * то же (исходное) место, координаты никогда не менялись. */
+  private applyMaterialReleased(materialId: string): void {
+    const material = this.entities.find((e): e is Material => e instanceof Material && e.id === materialId)
+    if (material) material.container.visible = true
+  }
+
+  /** Носитель утонул или иначе потерял материал — снимает клейм (в co-op —
+   * на сервере, широковещательно; в single player — сразу локально) и чистит
+   * собственное состояние переноса. */
+  private releaseCarriedMaterial(): void {
+    if (!this.carriedMaterialId) return
+    const materialId = this.carriedMaterialId
+
+    this.carriedMaterialId = null
+    this.carriedMaterialKind = null
+    if (this.activePlayer instanceof Ant) this.activePlayer.setCarriedMaterial(null)
+    this.updateHud()
+
+    if (this.network.getSnapshot().mode === "coop") {
+      this.network.requestMaterialRelease(this.levelIndex, materialId)
+    } else {
+      this.applyMaterialReleased(materialId)
+    }
+  }
+
+  /** Пытается установить материал, который сейчас несёт активный игрок, в
+   * слот моста — тот же принцип асинхронного применения, что и tryGrabMaterial. */
+  private tryInstallMaterial(material: Material, slot: BridgeSlot): void {
+    if (slot.isInstalled || slot.accepts !== "material") return
+
+    if (this.network.getSnapshot().mode === "coop") {
+      void this.network.requestMaterialInstall(this.levelIndex, material.id, slot.id)
+      return
+    }
+
+    this.applyMaterialInstalled(material.id, slot.id)
+  }
+
+  /** Окончательно ставит материал в слот — необратимо, освобождает носителя
+   * (если это были мы). */
+  private applyMaterialInstalled(materialId: string, slotId: string): void {
+    const slot = this.entities.find((e): e is BridgeSlot => e instanceof BridgeSlot && e.id === slotId)
+    const material = this.entities.find((e): e is Material => e instanceof Material && e.id === materialId)
+    if (!slot || !material || slot.isInstalled) return
+
+    slot.install(materialId, material.kind)
+    material.container.visible = false
+
+    if (this.carriedMaterialId === materialId) {
+      this.carriedMaterialId = null
+      this.carriedMaterialKind = null
+      if (this.activePlayer instanceof Ant) this.activePlayer.setCarriedMaterial(null)
+      this.updateHud()
+    }
+  }
+
+  /** Топит активного муравья: роняет то, что он нёс, и запускает
+   * Ant.drown() — respawn на чекпоинте случится позже, из блока смерти в
+   * update(), когда истечёт DEATH_RESTART_DELAY после diedFromDrowning. */
+  private drownActivePlayer(ant: Ant): void {
+    this.releaseCarriedMaterial()
+    ant.drown()
+  }
+
+  /** Респавнит нового муравья на последнем чекпоинте вместо перезапуска
+   * всего уровня/комнаты — Pond/BridgeSlot/Material/BigBranch не трогаются,
+   * прогресс моста и материалы остаются как были. */
+  private respawnAntAtCheckpoint(): void {
+    const dead = this.activePlayer
+    if (dead) {
+      this.worldContainer.removeChild(dead.container)
+      this.entities = this.entities.filter((e) => e !== dead)
+    }
+
+    const ant = new Ant(this.input, this.lastCheckpointX, this.lastCheckpointY)
+    this.activePlayer = ant
+    this.addEntity(ant)
+
+    this.worldContainer.scale.set(this.antFocusZoomScale)
+    this.worldContainer.pivot.set(ant.container.x, ant.container.y)
+    this.worldContainer.position.set(window.innerWidth / 2, window.innerHeight / 2)
+
+    this.deathTimer = 0
+    this.pondUnsafeTimer = 0
   }
 
   /** Гость применяет состояние врагов, присланное хостом — вместо своего ИИ
@@ -481,30 +836,41 @@ export class GameScene extends Scene {
   }
 
   /** Оба игрока получили это широковещательно (включая того, кто дошёл до
-   * двери и попросил переход) — единственная точка, где реально происходит
-   * переход level 0 -> 1 в co-op (см. GameNetworkStore.requestAdvanceLevel). */
+   * двери/края уровня и попросил переход) — единственная точка, где реально
+   * происходит переход 0->1 (копание, вертикально) или 1->2 (муравей выходит
+   * к пруду, горизонтально) в co-op (см. GameNetworkStore.requestAdvanceLevel). */
   private applyLevelAdvanced(payload: LevelAdvancedPayload): void {
     this.pendingAdvanceLevel = false
 
-    if (this.levelIndex !== 0 || payload.levelState.level !== 1) {
+    if (payload.levelState.level !== this.levelIndex + 1) {
       // Устаревшее/чужое событие (например, мы уже успели уйти дальше по
-      // локальному прогрессу уровня 2+) — молча игнорируем.
+      // локальному прогрессу уровня 3+) — молча игнорируем.
       return
     }
 
+    // 0->1 — вертикальный переход (копание, тот же мир продолжается выше);
+    // 1->2 — горизонтальный (муравей выходит на новый сегмент с прудом),
+    // та же прогрессия X, что и у локального (single player) перехода —
+    // см. ветку levelIndex === 1 ниже в update().
+    const isDigTransition = this.levelIndex === 0
     const previousHeight = this.roomLevelHeight
 
     // Тот же приём, что и в исходном локальном переходе: оставляем только
     // активного игрока и напарника, остальное (стены/предметы старого
-    // level 0) регенерируется заново из нового seed.
+    // уровня) регенерируется заново из нового seed.
     this.entities = this.entities.filter((entity) => entity === this.activePlayer || this.isRemoteEntity(entity))
     this.worldContainer.removeChildren()
     if (this.activePlayer) this.worldContainer.addChild(this.activePlayer.container)
     for (const remote of this.remoteEntities.values()) this.worldContainer.addChild(remote.entity.container)
 
-    // Абсолютная позиция игрока НЕ меняется (та же дверь, тот же шов между
-    // уровнями) — сдвигаем только систему координат уровня, как и раньше.
-    this.currentLevelYOffset -= previousHeight
+    if (isDigTransition) {
+      // Абсолютная позиция игрока НЕ меняется (та же дверь, тот же шов между
+      // уровнями) — сдвигаем только систему координат уровня, как и раньше.
+      this.currentLevelYOffset -= previousHeight
+    } else {
+      this.currentLevelXOffset += window.innerWidth
+    }
+
     this.prepareRoomLevel(payload.levelState, payload.epoch)
 
     this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
@@ -601,10 +967,70 @@ export class GameScene extends Scene {
       }
     }
 
-    if (!this.network.isHost()) {
-      const latest = this.network.getLatestEnemyState()
-      if (latest) this.applyEnemyNetStates(latest)
+    // Уровень 3 (индекс 2, пруд/мост) — тот же принцип "накопили за кадр,
+    // вычерпали один раз", см. комментарий у остальных drain* выше.
+    const materialUpdates = this.network.drainMaterialUpdates()
+    for (const update of materialUpdates) {
+      if (update.level !== level || update.epoch !== epoch) continue
+      if (update.carrierId) {
+        this.applyMaterialGrabbed(update.materialId, update.carrierId === this.network.getSnapshot().localPlayerId)
+      } else {
+        this.applyMaterialReleased(update.materialId)
+      }
     }
+
+    const slotUpdates = this.network.drainSlotUpdates()
+    for (const update of slotUpdates) {
+      if (update.level !== level || update.epoch !== epoch) continue
+      this.applyMaterialInstalled(update.materialId, update.slotId)
+    }
+
+    if (level === 2) {
+      const bigBranch = this.entities.find((e): e is BigBranch => e instanceof BigBranch)
+      if (bigBranch && !this.network.isHost()) {
+        const latestBigBranch = this.network.getLatestBigBranchState()
+        if (latestBigBranch && latestBigBranch.level === level && latestBigBranch.epoch === epoch) {
+          bigBranch.setRemoteState(latestBigBranch.progress)
+        }
+      }
+
+      // И у хоста (после его собственного tick в основном update()), и у
+      // гостя (сразу после setRemoteState выше) — как только прогресс достиг
+      // 1, финальный слот должен стать платформой; идемпотентно на обеих
+      // сторонах (BridgeSlot.install уже сам себя не даёт вызвать дважды).
+      if (bigBranch && bigBranch.progress >= 1 && !bigBranch.installed) {
+        bigBranch.markInstalled()
+        const finalSlot = this.entities.filter((e): e is BridgeSlot => e instanceof BridgeSlot).find((slot) => slot.accepts === "bigBranch")
+        if (finalSlot && !finalSlot.isInstalled) finalSlot.install("bigBranch", "bigBranch")
+      }
+    }
+
+    const isHostNow = this.network.isHost()
+
+    if (!isHostNow) {
+      // Интерполированное состояние (см. getInterpolatedEnemyStates), а не
+      // сырое последнее — иначе враги у гостя дёргались бы/телепортировались
+      // между редкими (раз в minEnemyStateIntervalMs) обновлениями от хоста.
+      const latest = this.network.getInterpolatedEnemyStates()
+      if (latest.length > 0) this.applyEnemyNetStates(latest)
+    }
+
+    if (this.wasHost === false && isHostNow) {
+      // Прежний хост вышел (или мы им стали по другой причине), и теперь
+      // первые по RoomInfo.players — мы. Подхватываем ИИ врагов/стража с их
+      // ТЕКУЩИХ (уже отрисованных) позиций — сущности те же самые, что были
+      // спавнены изначально из общего seed, никто не пересоздаётся и не
+      // дублируется, просто раньше молчавший puppet-режим выключается.
+      const enemies = this.entities.filter((e): e is EnemyWorm => e instanceof EnemyWorm)
+      const guards = this.entities.filter((e): e is GuardWorm => e instanceof GuardWorm)
+      for (const enemy of enemies) enemy.resumeLocalControl()
+      for (const guard of guards) guard.resumeLocalControl()
+
+      const bigBranch = this.entities.find((e): e is BigBranch => e instanceof BigBranch)
+      bigBranch?.resumeLocalControl()
+    }
+
+    this.wasHost = isHostNow
   }
 
   /** Читает сохранённый кнопкой уровень (0, если нет/повреждён/невалиден). */
@@ -646,9 +1072,13 @@ export class GameScene extends Scene {
     // напрямую: в single player они равны (см. onCreate), но в co-op это
     // размеры, УЖЕ закреплённые сервером для этой комнаты (см. prepareRoomLevel) —
     // могут отличаться от собственного viewport этого клиента, если партнёр
-    // зашёл первым с другим размером экрана.
-    const width = level <= 1 ? this.roomLevelWidth : window.innerWidth
-    const height = level <= 1 ? this.roomLevelHeight : window.innerHeight
+    // зашёл первым с другим размером экрана. Уровень 2 (пруд/мост) — тот же
+    // принцип, только отдельными полями (pondLevelWidth/Height): его размер —
+    // всегда один "экран" (в отличие от увеличенных digLevelWidth/Height), и
+    // 0 по умолчанию (single player/пока co-op ещё не согласовал) — тогда
+    // подставляем обычный window.innerWidth/Height.
+    const width = level <= 1 ? this.roomLevelWidth : level === 2 ? this.pondLevelWidth || window.innerWidth : this.waterLevelWidth || window.innerWidth
+    const height = level <= 1 ? this.roomLevelHeight : level === 2 ? this.pondLevelHeight || window.innerHeight : this.waterLevelHeight || window.innerHeight
 
     // Дверной проём по центру, общий для потолка уровня 0 и пола уровня 1 —
     // одни и те же X-границы гарантируют, что проход между уровнями всегда
@@ -785,27 +1215,45 @@ export class GameScene extends Scene {
     } else if (level === 2) {
       // Уровень 3 (индекс 2) — открытая поверхность, продолжение уровня 1
       // вправо: та же линия травы на той же высоте, голубое небо с облаками
-      // вместо пустоты. Из препятствий — лужи прямо в линии травы: муравей
-      // не проходит сквозь них, пока не наведёт мостик из подобранного по
-      // пути листа (Leaf/Puddle, см. GameScene.update). В отличие от уровня
-      // 4+ ниже, тут муравей ещё муравей — он проходит метаморфозу в жабу
-      // только у ПРАВОГО края этого уровня (см. update()).
+      // вместо пустоты. Единственная преграда — один большой Pond по центру
+      // сегмента (делит берега пополам, обойти нельзя), проходится только по
+      // наведённому мосту (BridgeSlot × BRIDGE_SLOT_COUNT). Муравей ещё
+      // муравей — метаморфоза в жабу только у ПРАВОГО края уровня (см.
+      // update()), что естественно требует сперва достроить мост.
+      //
+      // Сбрасываем состояние переноса материала при каждой (пере)генерации
+      // этого сегмента — GameScene живёт дольше одного прохождения уровня
+      // (рестарт/повторный вход), а это поле иначе пережило бы его.
+      this.carriedMaterialId = null
+      this.carriedMaterialKind = null
+      this.pondUnsafeTimer = 0
+
       this.addEntity(new Sky(startX, startY, width, this.grassLineY))
 
-      // Лужи стоят равномерно по сегменту (примерно на 1/3 и 2/3 ширины) —
-      // подальше от краёв и от кнопки сохранения посередине.
-      const puddleSpacing = width / (LEVEL3_PUDDLE_COUNT + 1)
-      const puddleLefts: number[] = []
-      for (let i = 0; i < LEVEL3_PUDDLE_COUNT; i++) {
-        const centerX = startX + puddleSpacing * (i + 1)
-        puddleLefts.push(centerX - PUDDLE_WIDTH / 2)
-      }
-      const isInsidePuddle = (x: number) => puddleLefts.some((left) => x >= left && x < left + PUDDLE_WIDTH)
+      // Пруд начинается заметно правее центра сегмента (см. POND_START_RATIO) —
+      // сам центр (width/2) занят точкой спавна "продолжить с сохранения"/
+      // позднего co-op подключения и кнопкой сохранения (обе — ниже по этому
+      // же методу, координата startX + width/2), она должна остаться на
+      // суше, а не оказаться внутри воды.
+      //
+      // Оба края округляем НАРУЖУ до границы клетки (this.cellSize) — трава
+      // ниже пропускается по тому же тестовому x, каким рисуется её клетка
+      // (шаг цикла — cellSize), так что нерокруглённый пруд оставлял бы
+      // тёмную щель шириной до клетки там, где сам пруд уже кончился, а
+      // трава ещё не началась (её клетка целиком пропущена из-за одной
+      // точки старта внутри пруда).
+      const rawPondLeft = startX + width * POND_START_RATIO
+      const rawPondRight = rawPondLeft + width * POND_WIDTH_RATIO
+      const pondLeft = startX + Math.floor((rawPondLeft - startX) / this.cellSize) * this.cellSize
+      const pondRight = startX + Math.ceil((rawPondRight - startX) / this.cellSize) * this.cellSize
+      const pondWidth = pondRight - pondLeft
+      const pondTop = startY + this.grassLineY
+      const isInsidePond = (x: number) => x >= pondLeft && x < pondRight
 
       for (let x = startX; x < startX + width + this.cellSize; x += this.cellSize) {
-        // Клетки травы под будущей лужей не рисуем — саму лужу ставим поверх
-        // отдельно ниже, одной сущностью на всю её ширину, а не по клеткам.
-        if (!isInsidePuddle(x)) {
+        // Клетки травы под прудом не рисуем — сам пруд встаёт поверх
+        // отдельно ниже, одной сущностью на всю его ширину, а не по клеткам.
+        if (!isInsidePond(x)) {
           this.addEntity(new Wall(x, startY + this.grassLineY, this.cellSize, this.cellSize, "grass"))
         }
 
@@ -814,16 +1262,55 @@ export class GameScene extends Scene {
         }
       }
 
-      for (const left of puddleLefts) {
-        this.addEntity(new Puddle(left, startY + this.grassLineY, PUDDLE_WIDTH, PUDDLE_HEIGHT))
+      this.addEntity(new Pond(pondLeft, pondTop, pondWidth, POND_HEIGHT))
+
+      // BRIDGE_SLOT_COUNT слотов подряд над прудом, ВПЛОТНУЮ друг к другу
+      // (ширина = ровно pondWidth / BRIDGE_SLOT_COUNT, без зазоров) — иначе
+      // между двумя уже установленными соседними слотами осталась бы полоска
+      // пруда, ничьим слотом не покрытая, и муравей тонул бы, стоя ровно
+      // между ними. Последний слот принимает только большую ветку (BigBranch),
+      // остальные — любой мелкий материал.
+      const slotWidth = pondWidth / BRIDGE_SLOT_COUNT
+      const slots: BridgeSlot[] = []
+      for (let i = 0; i < BRIDGE_SLOT_COUNT; i++) {
+        const slotLeft = pondLeft + slotWidth * i
+        const accepts = i === BRIDGE_SLOT_COUNT - 1 ? "bigBranch" : "material"
+        const slot = new BridgeSlot(slotLeft, pondTop, slotWidth, POND_HEIGHT, `2:slot:${i}`, accepts)
+        this.addEntity(slot)
+        slots.push(slot)
       }
 
-      // Кусочки листа разбросаны по всему сегменту, с запасом — луж всего
-      // LEVEL3_PUDDLE_COUNT штук, а листьев заметно больше.
-      for (let i = 0; i < LEVEL3_LEAF_COUNT; i++) {
-        const leafX = startX + 60 + Math.random() * (width - 120)
-        this.addEntity(new Leaf(leafX, startY + this.grassLineY - 16))
+      // Чекпоинт на левом берегу, с запасом перед прудом (но правее точки
+      // спавна startX + width/2 — см. комментарий у pondLeft выше). Запас
+      // (не "pondLeft - 1px") специально больше ширины хитбокса муравья
+      // (~45px, см. Ant.applyTextureScale) — иначе муравей, едва ДОЙДЯ до
+      // флажка, уже касался бы пруда своим хитбоксом (тот шире, чем видимый
+      // силуэт левее container.x) и тонул бы, не успев ничего построить.
+      // Respawn-точка по умолчанию (до первого касания) — начало сегмента,
+      // где муравей и так появляется после уровня 1.
+      this.addEntity(new Checkpoint(pondLeft - 60, startY + this.grassLineY - 6))
+      this.lastCheckpointX = startX + 60
+      this.lastCheckpointY = startY + this.grassLineY - 6
+
+      // Мелкие материалы (лист/ветка) разбросаны по обоим берегам — с
+      // запасом, слотов, которые ими закрываются, BRIDGE_SLOT_COUNT - 1.
+      for (let i = 0; i < POND_MATERIAL_COUNT; i++) {
+        let materialX = startX + 40 + this.rng() * (width - 80)
+        while (isInsidePond(materialX)) {
+          materialX = startX + 40 + this.rng() * (width - 80)
+        }
+        const kind: MaterialKind = this.rng() < 0.5 ? "leaf" : "branch"
+        this.addEntity(new Material(materialX, startY + this.grassLineY - 14, `2:material:${i}`, kind))
       }
+
+      // Большая ветка стартует у левого берега и толкается к последнему
+      // слоту — см. Ant/BigBranch tick в update().
+      const finalSlot = slots[slots.length - 1]
+      const bigBranchWidth = MATERIAL_SIZE * 2.2
+      const bigBranchTargetX = finalSlot.container.x + finalSlot.width / 2 - bigBranchWidth / 2
+      this.addEntity(
+        new BigBranch(startX + 90, bigBranchTargetX, startY + this.grassLineY - 10, bigBranchWidth, MATERIAL_SIZE * 1.3),
+      )
     } else if (level >= 3) {
       // Уровень 4 (индекс 3) и дальше — водоём: муравей уже прошёл
       // метаморфозу в жабу на правом краю уровня 3 (см. update()), и весь
@@ -1090,11 +1577,10 @@ export class GameScene extends Scene {
     this.revealText.visible = false
     this.hudContainer.addChild(this.revealText)
 
-    // Счётчик листьев — виден только на уровне 3+ (поверхность с лужами),
-    // на копании он бессмысленен, поэтому по умолчанию скрыт (см.
-    // updateHud — показывается, только когда levelIndex >= 2).
+    // Индикатор переносимого материала — виден только на уровне 3 (пруд/
+    // мост) и только пока муравей что-то несёт в щелепах (см. updateHud).
     this.leavesText = new Text({
-      text: "🍃 0",
+      text: "🍃",
       style: new TextStyle({
         fontFamily: "sans-serif",
         fontSize: 18,
@@ -1155,10 +1641,10 @@ export class GameScene extends Scene {
     }
 
     if (this.leavesText) {
-      // Листья нужны только на уровне 2 (лужи) — на воде (4+) их уже некуда
-      // тратить (там нет луж), так что счётчик там снова прячем.
-      this.leavesText.visible = this.levelIndex === 2
-      this.leavesText.text = `🍃 ${this.carriedLeaves}`
+      // Виден только на уровне 3 (пруд/мост) и только пока муравей реально
+      // что-то несёт — вне этого уровня переносить нечего.
+      this.leavesText.visible = this.levelIndex === 2 && this.carriedMaterialKind !== null
+      this.leavesText.text = this.carriedMaterialKind === "leaf" ? "🍃 в щелепах" : this.carriedMaterialKind === "branch" ? "🌿 в щелепах" : ""
     }
   }
 
@@ -1216,7 +1702,12 @@ export class GameScene extends Scene {
 
     const oldTexture = this.fogSprite.texture
     this.fogSprite.texture = this.buildFogTexture()
-    oldTexture.destroy(true)
+    // oldTexture может оказаться уже null, если fogSprite успел быть
+    // уничтожен целиком (Scene.destroy() -> container.destroy({children:true}))
+    // асинхронной цепочкой, продолжившей выполняться уже после этого (см.
+    // GameScene.destroyed) — сам this.fogSprite при этом остаётся тем же
+    // JS-объектом, просто с обнулёнными внутренностями.
+    oldTexture?.destroy(true)
   }
 
   /**
@@ -1303,11 +1794,11 @@ export class GameScene extends Scene {
         this.activePlayer.container.alpha = Math.sin(this.metaTimer * 30) * 0.4 + 0.6
         this.activePlayer.container.scale.set(Math.sin(this.metaTimer * 12) * 0.15 + 1)
 
-        if (this.metaTimer >= TRANSFORM_DURATION) {
-          this.worldContainer.removeChild(this.activePlayer.container)
-          this.entities = this.entities.filter((e) => e !== this.activePlayer)
-
+        if (this.metaTimer >= TRANSFORM_DURATION && !this.pendingWaterSegment) {
           if (this.activePlayer instanceof Worm) {
+            this.worldContainer.removeChild(this.activePlayer.container)
+            this.entities = this.entities.filter((e) => e !== this.activePlayer)
+
             // Y муравья фиксируем на линии травы (та же формула, что и в
             // onCreate/SaveButton), а не берём "как есть" от червяка: тот
             // ловится триггером ZOOM_IN уже НЕДОкопав ровно до травы (см.
@@ -1324,6 +1815,7 @@ export class GameScene extends Scene {
             this.worldContainer.addChild(ant.container)
 
             console.log("Метаморфоз завершен! Родился Муравей.")
+            this.metaState = MetaState.ZOOM_OUT
           } else {
             // Ant -> Frog: муравей у правого края уровня 2 (лужи/листья)
             // превращается в жабу — и заодно уровень тут же переходит на
@@ -1331,35 +1823,53 @@ export class GameScene extends Scene {
             // переход между сегментами муравья (levelIndex++, X-смещение на
             // ширину экрана, чистка сущностей позади), только сопровождается
             // самим превращением, а не происходит мгновенно.
-            this.levelIndex++
-            this.currentLevelXOffset += window.innerWidth
+            //
+            // В co-op сперва нужно узнать у сервера канонический seed/размер
+            // ПЕРВОГО водного сегмента (см. prepareWaterSegment) — держим
+            // муравья на экране ещё несколько кадров (pendingWaterSegment
+            // блокирует повторный вход сюда, TRANSFORM-анимация просто
+            // продолжает мигать — безвредно, alpha/scale периодические), пока
+            // не придёт ответ. В single player prepareWaterSegment()
+            // резолвится немедленно (сети нет).
+            this.pendingWaterSegment = true
+            const targetLevel = this.levelIndex + 1
 
-            const safeXBound = this.currentLevelXOffset - window.innerWidth * 2
-            this.entities = this.entities.filter((entity) => {
-              if (entity.container.x < safeXBound) {
-                this.worldContainer.removeChild(entity.container)
-                return false
-              }
-              return true
+            this.prepareWaterSegment(targetLevel).then(() => {
+              this.pendingWaterSegment = false
+              if (this.destroyed) return
+
+              this.worldContainer.removeChild(this.activePlayer.container)
+              this.entities = this.entities.filter((e) => e !== this.activePlayer)
+
+              this.levelIndex = targetLevel
+              this.currentLevelXOffset += window.innerWidth
+
+              const safeXBound = this.currentLevelXOffset - window.innerWidth * 2
+              this.entities = this.entities.filter((entity) => {
+                if (entity.container.x < safeXBound) {
+                  this.worldContainer.removeChild(entity.container)
+                  return false
+                }
+                return true
+              })
+
+              this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
+
+              // Жаба рождается по центру высоты водного сегмента — свободного
+              // плавания по вертикали у муравья не было, так что фиксированной
+              // "линии травы" тут взять неоткуда.
+              const frogY = this.currentLevelYOffset + window.innerHeight / 2
+              const frogX = this.currentLevelXOffset + 60
+              const frog = new Frog(this.input, frogX, frogY)
+              this.activePlayer = frog
+
+              this.addEntity(frog)
+              this.worldContainer.addChild(frog.container)
+
+              console.log("Метаморфоз завершён! Рождена Жаба.")
+              this.metaState = MetaState.ZOOM_OUT
             })
-
-            this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
-
-            // Жаба рождается по центру высоты водного сегмента — свободного
-            // плавания по вертикали у муравья не было, так что фиксированной
-            // "линии травы" тут взять неоткуда.
-            const frogY = this.currentLevelYOffset + window.innerHeight / 2
-            const frogX = this.currentLevelXOffset + 60
-            const frog = new Frog(this.input, frogX, frogY)
-            this.activePlayer = frog
-
-            this.addEntity(frog)
-            this.worldContainer.addChild(frog.container)
-
-            console.log("Метаморфоз завершён! Рождена Жаба.")
           }
-
-          this.metaState = MetaState.ZOOM_OUT
         }
         break
 
@@ -1443,7 +1953,7 @@ export class GameScene extends Scene {
     if (this.network.getSnapshot().mode !== "coop") return
 
     if (this.activePlayer) {
-      const form: PlayerForm = this.activePlayer instanceof Ant ? "ant" : "worm"
+      const form: PlayerForm = this.activePlayer instanceof Ant ? "ant" : this.activePlayer instanceof Frog ? "frog" : "worm"
       this.network.reportLocalPose(this.activePlayer.container.x, this.activePlayer.container.y, form)
     }
 
@@ -1475,6 +1985,39 @@ export class GameScene extends Scene {
     return false
   }
 
+  /** Все "игроки", реально видимые в этом кадре — свой активный + напарники
+   * (в co-op на общем уровне у нас есть их визуальные прокси-сущности,
+   * синхронизируемые в syncNetwork; этого достаточно для проверки
+   * столкновений с врагами/стражем на стороне хоста, даже если у хоста нет
+   * прямого доступа к настоящему инстансу игрока напарника). Мёртвые
+   * (isDead) исключаются — как и раньше для одиночного activePlayer. */
+  private getAllPlayerEntities(): (Worm | Ant | Frog)[] {
+    const result: (Worm | Ant | Frog)[] = []
+    if (this.activePlayer && this.entities.includes(this.activePlayer) && !this.activePlayer.isDead) {
+      result.push(this.activePlayer)
+    }
+    for (const remote of this.remoteEntities.values()) {
+      if (!remote.entity.isDead) result.push(remote.entity)
+    }
+    return result
+  }
+
+  /** То же самое, что и getAllPlayerEntities(), но в формате, который
+   * понимает GuardWorm.tick() — только позиция + стабильный id (нужен ему для
+   * гистерезиса переключения цели между кадрами, см. GuardWorm.currentTargetId).
+   * "local" — id нашего собственного игрока, playerId напарника — ключ той
+   * же remoteEntities Map, что использует upsertRemoteEntity. */
+  private getGuardTargets(): GuardTarget[] {
+    const targets: GuardTarget[] = []
+    if (this.activePlayer && this.entities.includes(this.activePlayer) && !this.activePlayer.isDead) {
+      targets.push({ id: "local", x: this.activePlayer.container.x, y: this.activePlayer.container.y })
+    }
+    for (const [playerId, remote] of this.remoteEntities) {
+      if (!remote.entity.isDead) targets.push({ id: playerId, x: remote.entity.container.x, y: remote.entity.container.y })
+    }
+    return targets
+  }
+
   /** "host" — игрок, зашедший в комнату первым (RoomInfo.players[0]), "guest" —
    * второй. Порядок в RoomInfo.players общий для обоих клиентов (см.
    * PlayerCosmetics) — оба клиента всегда сходятся, кто есть кто. */
@@ -1490,25 +2033,27 @@ export class GameScene extends Scene {
     let remote = this.remoteEntities.get(state.playerId)
 
     if (!remote) {
-      const worm = new Worm(this.dummyInput)
-      worm.container.x = state.x
-      worm.container.y = state.y
-      worm.init()
-      worm.applyRemoteLook(this.getRemoteRole(state.playerId))
+      // Уже в нужной форме сразу (а не всегда Worm с последующей мгновенной
+      // пересоздачей ниже) — важно для позднего присоединения: если
+      // напарник к этому моменту уже, скажем, жаба, самый первый снапшот о
+      // нём тоже должен создать именно Frog.
+      const entity = this.createRemotePlayerEntity(state.form, state.x, state.y)
+      entity.applyRemoteLook(this.getRemoteRole(state.playerId))
 
-      remote = { entity: worm, form: "worm" }
+      remote = { entity, form: state.form }
       this.remoteEntities.set(state.playerId, remote)
-      this.addEntity(worm)
+      this.addEntity(entity)
     }
 
     if (remote.form !== state.form) {
-      // Напарник прошёл метаморфозу у себя — пересоздаём тем же классом,
-      // что и локальный игрок (Worm -> Ant), без кат-сцены с зумом: камера
-      // в этой сцене одна и следит только за нашим собственным игроком.
+      // Напарник прошёл метаморфозу у себя — пересоздаём ТЕМ ЖЕ классом, что
+      // и локальный игрок (Worm -> Ant -> Frog, см. createRemotePlayerEntity),
+      // без кат-сцены с зумом: камера в этой сцене одна и следит только за
+      // нашим собственным игроком.
       this.worldContainer.removeChild(remote.entity.container)
       this.entities = this.entities.filter((e) => e !== remote!.entity)
 
-      const nextEntity: Worm | Ant = new Ant(this.dummyInput, state.x, state.y)
+      const nextEntity = this.createRemotePlayerEntity(state.form, state.x, state.y)
       nextEntity.applyRemoteLook(this.getRemoteRole(state.playerId))
       remote = { entity: nextEntity, form: state.form }
       this.remoteEntities.set(state.playerId, remote)
@@ -1516,10 +2061,28 @@ export class GameScene extends Scene {
     }
 
     if (remote.entity instanceof Ant) {
+      // Муравей ходит только по одной линии травы — Y не шарится (см.
+      // Ant.setRemotePosition).
       remote.entity.setRemotePosition(state.x)
     } else {
+      // Worm/Frog двигаются по обеим осям.
       remote.entity.setRemotePosition(state.x, state.y)
     }
+  }
+
+  /** Создаёт сущность напарника нужного класса по его форме — единственное
+   * место, решающее "какой класс соответствует какой PlayerForm" (используется
+   * и при первом появлении неизвестного напарника, и при пересоздании после
+   * его метаморфозы, см. upsertRemoteEntity выше). */
+  private createRemotePlayerEntity(form: PlayerForm, x: number, y: number): Worm | Ant | Frog {
+    if (form === "ant") return new Ant(this.dummyInput, x, y)
+    if (form === "frog") return new Frog(this.dummyInput, x, y)
+
+    const worm = new Worm(this.dummyInput)
+    worm.container.x = x
+    worm.container.y = y
+    worm.init()
+    return worm
   }
 
   /**
@@ -1611,7 +2174,7 @@ export class GameScene extends Scene {
         return
       }
 
-      if (this.levelIndex <= 1) {
+      if (this.levelIndex <= 2) {
         this.processSharedLevelEvents()
       }
     }
@@ -1624,7 +2187,13 @@ export class GameScene extends Scene {
     if (this.activePlayer && this.activePlayer.isDead) {
       this.deathTimer += deltaTime
       if (this.deathTimer >= DEATH_RESTART_DELAY) {
-        if (this.network.getSnapshot().mode === "coop" && this.levelIndex <= 1) {
+        if (this.levelIndex === 2) {
+          // Пруд/мост: смерть (утопление) — ЛИЧНАЯ, не рестартит ни уровень,
+          // ни (в co-op) комнату партнёра — респавн на чекпоинте, Pond/
+          // BridgeSlot/Material/BigBranch остаются как были (см. план —
+          // "не перезапускай весь рівень через смерть одного гравця").
+          this.respawnAntAtCheckpoint()
+        } else if (this.network.getSnapshot().mode === "coop" && this.levelIndex <= 1) {
           // Погибли на общем уровне — просим сервер перезапустить ВСЮ
           // комнату (иначе карты игроков тут же разошлись бы). Реальный
           // рестарт произойдёт из applyRoomRestart() выше, по широковещательному
@@ -1711,12 +2280,27 @@ export class GameScene extends Scene {
 
       // Уровень 3 (индекс 2): начинается, когда муравей добегает до правого
       // края экрана на уровне 1 — камера едет вправо, открывая новый кусок
-      // поверхности, симметрично тому, как вертикальные уровни открываются
-      // вверх при достижении верхнего края.
+      // поверхности с прудом, симметрично тому, как вертикальные уровни
+      // открываются вверх при достижении верхнего края. В co-op пруд/мост —
+      // общее состояние комнаты (см. RoomLevelState.materialCarriers/
+      // bridgeSlots/bigBranch), поэтому сам переход идёт через тот же
+      // requestAdvanceLevel, что и 0->1 (см. applyLevelAdvanced), а не
+      // мгновенно локально.
       if (this.activePlayer instanceof Ant && this.levelIndex === 1) {
         const localPlayerX = this.activePlayer.container.x - this.currentLevelXOffset
 
         if (localPlayerX >= window.innerWidth - 40) {
+          if (this.network.getSnapshot().mode === "coop") {
+            // Держим игрока у края, пока не придёт общий переход — тот же
+            // приём, что и у перехода 0->1 (см. выше в update()).
+            this.activePlayer.container.x = this.currentLevelXOffset + window.innerWidth - 40
+            if (!this.pendingAdvanceLevel) {
+              this.pendingAdvanceLevel = true
+              this.network.requestAdvanceLevel(1, 2, window.innerWidth, window.innerHeight)
+            }
+            return
+          }
+
           // Камера постоянно сфокусирована на муравье (см. ZOOM_OUT в
           // handleMetamorphosis) — плавный "панорамный" переход тут не
           // нужен: она и так уже смотрит точно на него и продолжит
@@ -1759,26 +2343,31 @@ export class GameScene extends Scene {
 
       // Следующий водный сегмент (уровень 5+): жаба доплывает до правого
       // края текущего сегмента — тот же приём смены сегмента, что и у
-      // муравья на уровне 1->2 (без метаморфозы, форма уже не меняется).
+      // муравья на уровне 1->2 (без метаморфозы, форма уже не меняется). В
+      // co-op прогресс на воде независим у каждого игрока (нет общей
+      // "двери") — переход не ждёт партнёра, только свой собственный
+      // round-trip до сервера за каноническим seed/размером следующего
+      // сегмента (см. prepareWaterSegment/pendingWaterSegment).
       if (this.activePlayer instanceof Frog && this.levelIndex >= 3) {
         const localPlayerX = this.activePlayer.container.x - this.currentLevelXOffset
 
         if (localPlayerX >= window.innerWidth - 40) {
-          this.levelIndex++
-          this.currentLevelXOffset += window.innerWidth
-
-          const safeXBound = this.currentLevelXOffset - window.innerWidth * 2
-          this.entities = this.entities.filter((entity) => {
-            if (entity !== this.activePlayer && entity.container.x < safeXBound) {
-              this.worldContainer.removeChild(entity.container)
-              return false
+          if (this.network.getSnapshot().mode === "coop") {
+            // Держим жабу у края, пока не придёт канонический сегмент.
+            this.activePlayer.container.x = this.currentLevelXOffset + window.innerWidth - 40
+            if (!this.pendingWaterSegment) {
+              this.pendingWaterSegment = true
+              const targetLevel = this.levelIndex + 1
+              this.prepareWaterSegment(targetLevel).then(() => {
+                this.pendingWaterSegment = false
+                if (this.destroyed) return
+                this.advanceWaterSegment(targetLevel)
+              })
             }
-            return true
-          })
+            return
+          }
 
-          this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
-
-          this.worldContainer.addChild(this.activePlayer.container)
+          this.advanceWaterSegment(this.levelIndex + 1)
           return
         }
       }
@@ -1826,39 +2415,109 @@ export class GameScene extends Scene {
         const maxX = this.currentLevelXOffset + window.innerWidth - 20
         this.activePlayer.container.x = Math.min(Math.max(this.activePlayer.container.x, minX), maxX)
 
-        // Кусочки листа (уровень 3+) — подбираются на ходу, как звёзды/
-        // пузырьки, и копятся в carriedLeaves до тех пор, пока не встретится
-        // лужа, которую нужно перекрыть мостиком (см. ниже).
-        const leaves = this.entities.filter((e): e is Leaf => e instanceof Leaf)
-        for (const leaf of leaves) {
-          if (leaf.container.visible && this.activePlayer.isColliding(leaf)) {
-            leaf.container.visible = false
-            this.carriedLeaves++
-            this.updateHud()
-          }
-        }
+        // Уровень 3 (индекс 2) — пруд/мост: чекпоинт, утопление, подбор и
+        // установка материала, толкание большой ветки. Пока муравей
+        // "борсается" после drown() (isFlailing) — никаких новых
+        // взаимодействий, только ждём, чем кончится (см. Ant.drown()).
+        if (!this.activePlayer.isFlailing) {
+          const ant = this.activePlayer
 
-        // Лужи (уровень 3+) — не пускают дальше, пока не наведён мостик. Есть
-        // с собой лист — тратим один и наводим мостик прямо на подходе,
-        // дальше эта лужа проходима навсегда; нет листа — не пускаем дальше
-        // той стороны, с которой муравей подошёл (не даём протиснуться).
-        const puddles = this.entities.filter((e): e is Puddle => e instanceof Puddle)
-        for (const puddle of puddles) {
-          if (puddle.isBridged || !this.activePlayer.isColliding(puddle)) continue
-
-          if (this.carriedLeaves > 0) {
-            this.carriedLeaves--
-            puddle.placeBridge()
-            this.updateHud()
-            continue
+          const checkpoint = this.entities.find((e): e is Checkpoint => e instanceof Checkpoint)
+          if (checkpoint && ant.isColliding(checkpoint)) {
+            this.lastCheckpointX = ant.container.x
+            this.lastCheckpointY = ant.container.y
           }
 
-          const antCenterX = this.activePlayer.container.x + this.activePlayer.width / 2
-          const puddleCenterX = puddle.container.x + puddle.width / 2
-          this.activePlayer.container.x =
-            antCenterX < puddleCenterX
-              ? puddle.container.x - this.activePlayer.width
-              : puddle.container.x + puddle.width
+          // Подбор мелкого материала (лист/ветка) — только если ещё ничего не несём.
+          if (!this.carriedMaterialKind) {
+            const materials = this.entities.filter((e): e is Material => e instanceof Material)
+            for (const material of materials) {
+              if (material.container.visible && ant.isColliding(material)) {
+                this.tryGrabMaterial(material)
+                break
+              }
+            }
+          }
+
+          // Установка в подходящий (ещё пустой) слот моста — рядом и материал
+          // в щелепах. Нарочно ДО проверки утопления ниже: муравей, только
+          // что дошедший до первого незаполненного слота с материалом,
+          // должен успеть установить его и тем самым спастись, а не тонуть
+          // на пороге собственной постройки (см. POND_DROWN_GRACE — в co-op
+          // установка ещё и не применяется мгновенно, идёт через сервер).
+          if (this.carriedMaterialId && this.carriedMaterialKind) {
+            const carriedMaterial = this.entities.find((e): e is Material => e instanceof Material && e.id === this.carriedMaterialId)
+            const openSlot = this.entities
+              .filter((e): e is BridgeSlot => e instanceof BridgeSlot)
+              .find((slot) => !slot.isInstalled && slot.accepts === "material" && ant.isColliding(slot))
+
+            if (carriedMaterial && openSlot) {
+              this.tryInstallMaterial(carriedMaterial, openSlot)
+            }
+          }
+
+          let justDrowned = false
+          const pond = this.entities.find((e): e is Pond => e instanceof Pond)
+          if (pond && ant.isColliding(pond)) {
+            // isColliding (не одна точка container.x) — тем же способом, что
+            // и столкновение с самим прудом выше: у Entity/Ant рамка
+            // столкновений — это весь AABB (container.x..+width), а не одна
+            // точка, так что "стоит ли муравей на мосту" обязана мериться
+            // тем же способом, иначе муравей мог тонуть, едва коснувшись
+            // края пруда хитбоксом, ещё визуально стоя на предыдущем
+            // (уже наведённом) слоте или даже на берегу перед первым слотом.
+            const slots = this.entities.filter((e): e is BridgeSlot => e instanceof BridgeSlot)
+            const isOnBridge = slots.some((slot) => slot.isInstalled && ant.isColliding(slot))
+
+            if (isOnBridge) {
+              this.pondUnsafeTimer = 0
+            } else {
+              // Не мгновенно на первом же кадре касания (см. POND_DROWN_GRACE) —
+              // даёт установке слота выше (особенно в co-op, где она идёт
+              // через сервер и применяется не в этом же кадре) шанс сработать
+              // раньше, чем муравей будет считаться утонувшим.
+              this.pondUnsafeTimer += deltaTime
+              if (this.pondUnsafeTimer >= POND_DROWN_GRACE) {
+                this.drownActivePlayer(ant)
+                justDrowned = true
+              }
+            }
+          } else {
+            this.pondUnsafeTimer = 0
+          }
+
+          if (!justDrowned) {
+            // Большая ветка — толкают 1 (медленно, в одиночной игре — за
+            // несколько заходов) или 2 муравья (нормальная скорость) разом.
+            // Считает только тот, кто её реально симулирует (хост/single
+            // player), см. BigBranch — гость лишь отрисовывает setRemoteState.
+            const bigBranch = this.entities.find((e): e is BigBranch => e instanceof BigBranch)
+            const simulatesBigBranch = this.network.getSnapshot().mode !== "coop" || this.network.isHost()
+
+            if (bigBranch && !bigBranch.installed && simulatesBigBranch) {
+              const carrierIds: string[] = []
+              const localId = this.network.getSnapshot().localPlayerId
+
+              if (!this.carriedMaterialKind && ant.isColliding(bigBranch) && localId) {
+                carrierIds.push(localId)
+              }
+              for (const [playerId, remote] of this.remoteEntities) {
+                if (remote.entity instanceof Ant && !remote.entity.isDead && remote.entity.isColliding(bigBranch)) {
+                  carrierIds.push(playerId)
+                }
+              }
+
+              bigBranch.tick(deltaTime, carrierIds.length)
+
+              if (bigBranch.progress >= 1) {
+                bigBranch.markInstalled()
+                const finalSlot = this.entities.filter((e): e is BridgeSlot => e instanceof BridgeSlot).find((slot) => slot.accepts === "bigBranch")
+                if (finalSlot && !finalSlot.isInstalled) finalSlot.install("bigBranch", "bigBranch")
+              }
+
+              this.network.sendBigBranchState(this.levelIndex, bigBranch.progress, carrierIds)
+            }
+          }
         }
 
         // Камера держит фокус на муравье постоянно (зум доведён до
@@ -1943,7 +2602,7 @@ export class GameScene extends Scene {
           } else {
             speedBubble.container.visible = false
             this.speedBoostTimer = SPEED_BOOST_DURATION
-            console.log("Пузырёк скорости собран! Скорость временно удвоена.")
+            console.log(`Пузырёк скорости собран! Скорость временно увеличена в ${SPEED_BOOST_MULTIPLIER}x.`)
           }
         }
       }
@@ -1999,17 +2658,22 @@ export class GameScene extends Scene {
       }
     })
 
-    // Страж реагирует только на игрока — вражеских воров ему вообще не
-    // передаём, поэтому пока он занят погоней в одном тоннеле, вор спокойно
-    // проскакивает мимо по другому пути. Столкновение с игроком смертельно:
-    // откатываем игрока на позицию до этого кадра (как будто упёрся в
-    // стену) и сразу убиваем — как от камня, дальше сработает обычный
-    // рестарт уровня по deathTimer.
+    // Страж реагирует на ЛЮБОГО игрока комнаты (см. GuardWorm.tick — ближайший
+    // в зоне агрессии, с гистерезисом переключения цели), вражеских воров ему
+    // вообще не передаём, поэтому пока он занят погоней в одном тоннеле, вор
+    // спокойно проскакивает мимо по другому пути. Столкновение с игроком
+    // смертельно: откатываем игрока на позицию до этого кадра (как будто
+    // упёрся в стену) и сразу убиваем — как от камня, дальше сработает
+    // обычный рестарт уровня по deathTimer. Это столкновение проверяем только
+    // для НАШЕГО собственного игрока — каждый клиент сам себе авторитет по
+    // смерти своего активного игрока (как и от камня/руки стража повсюду
+    // ниже); напарник ровно так же убьёт себя сам на своём клиенте.
     const guards = this.entities.filter((e): e is GuardWorm => e instanceof GuardWorm)
     const playerForGuard = this.activePlayer && this.entities.includes(this.activePlayer) ? this.activePlayer : undefined
+    const guardTargets = this.getGuardTargets()
 
     for (const guard of guards) {
-      guard.tick(deltaTime, walls, playerForGuard?.container.x, playerForGuard?.container.y)
+      guard.tick(deltaTime, walls, guardTargets)
     }
 
     if (playerForGuard) {
@@ -2038,6 +2702,13 @@ export class GameScene extends Scene {
     const isHostSimulating = !isCoopShared || this.network.isHost()
 
     if (isHostSimulating) {
+      // Валидное столкновение с вором — это столкновение ЛЮБОГО игрока
+      // комнаты, не только собственного activePlayer хоста: у хоста нет
+      // прямого доступа к настоящему инстансу игрока-напарника, но есть его
+      // синхронизированная прокси-сущность (см. getAllPlayerEntities), и её
+      // позиции для проверки столкновения достаточно.
+      const players = this.getAllPlayerEntities()
+
       for (const enemy of enemies) {
         if (!enemy.carriedStar && enemy.stealCooldown <= 0) {
           const stolen = stealableStars.find((star) => star.container.visible && enemy.isColliding(star))
@@ -2056,7 +2727,8 @@ export class GameScene extends Scene {
           console.log("Вражеский червяк донёс звезду до домика!")
         }
 
-        if (enemy.carriedStar && this.activePlayer && this.entities.includes(this.activePlayer) && this.activePlayer.isColliding(enemy)) {
+        const collidingPlayer = enemy.carriedStar ? players.find((player) => player.isColliding(enemy)) : undefined
+        if (enemy.carriedStar && collidingPlayer) {
           enemy.carriedStar.container.position.set(enemy.container.x, enemy.container.y)
           enemy.carriedStar.container.visible = true
           enemy.carriedStar = undefined
