@@ -69,6 +69,18 @@ export class Engine {
     this.onFpsSample = listener
   }
 
+  /** Меню паузы (см. Game.tsx/PauseMenu) — тонкий проксі до текущей сцены
+   * (см. Scene.setPaused/GameScene.setPaused). До готовности initialize()
+   * (this.scene ещё null) — no-op, звать тут нечего. */
+  public setPaused(paused: boolean): void {
+    this.scene?.setPaused(paused)
+  }
+
+  /** "Начать уровень заново" из меню паузы — тот же проксі-принцип. */
+  public restartLevel(): void {
+    this.scene?.restartLevel()
+  }
+
   private update = (): void => {
     if (!this.app) return
 

@@ -95,6 +95,13 @@ export class GameScene extends Scene {
   private activePlayer!: any
   private deathTimer = 0
 
+  /** Пауза из меню (см. setPaused/PauseMenu) — блокирует ЛОКАЛЬНОЕ
+   * управление/взаимодействие активного игрока с миром (см. update()), но
+   * не трогает syncNetwork/обработку широковещательных событий/ИИ врагов и
+   * стража — в co-op хост и на паузе обязан продолжать считать общий мир
+   * для партнёра, иначе у того тоже всё замрёт. */
+  private paused = false
+
   /** true после Scene.destroy() (см. onDestroy ниже) — нужен исключительно
    * для того, чтобы прервать уже запущенные асинхронные цепочки (startCoopLevel/
    * startCoopFrogLevel/prepareWaterSegment, все — await сети) ПОСЛЕ того, как
@@ -1930,7 +1937,10 @@ export class GameScene extends Scene {
     return window.innerWidth * (this.isMobileViewport() ? MOBILE_DIG_LEVEL_EXTRA_MULTIPLIER : 1)
   }
 
-  private restartLevel(): void {
+  /** Тоже вызывается при смерти (см. update()), а теперь ещё и явно из
+   * меню паузы ("Начать уровень заново" — см. PauseMenu/Engine.restartLevel) —
+   * поэтому public, а не только internal. */
+  public restartLevel(): void {
     this.worldContainer.removeChildren()
     this.entities = []
     // Контейнеры напарника уже уничтожены строкой выше (removeChildren) —
@@ -1939,7 +1949,18 @@ export class GameScene extends Scene {
     // создать их заново.
     this.remoteEntities.clear()
     this.deathTimer = 0
+    // Ручной рестарт из меню паузы не обязан снимать паузу сам по себе —
+    // это решает вызывающий код (PauseMenu закрывает меню и снимает паузу
+    // одним действием), но на всякий случай не оставляем локальное
+    // управление заблокированным для новой сцены, если вызвали не оттуда.
+    this.setPaused(false)
     this.onCreate()
+  }
+
+  /** См. PauseMenu — переопределяет пустую реализацию по умолчанию из Scene. */
+  public override setPaused(paused: boolean): void {
+    this.paused = paused
+    this.input.setEnabled(!paused)
   }
 
   /**
@@ -2184,7 +2205,14 @@ export class GameScene extends Scene {
       return
     }
 
-    if (this.activePlayer && this.activePlayer.isDead) {
+    // Пауза (см. setPaused/PauseMenu) — блокирует ТОЛЬКО локальную часть кадра
+    // ниже (смерть/рестарт по таймеру, движение, переходы между уровнями,
+    // подбор предметов, камера) — то, что относится исключительно к
+    // локальному игроку. syncNetwork/обработка широковещательных событий/ИИ
+    // врагов и стража (тикаются отдельно, ниже по этому же методу, вне
+    // блоков this.activePlayer) продолжают идти как обычно, иначе в co-op
+    // пауза одного игрока замораживала бы игру партнёра тоже.
+    if (!this.paused && this.activePlayer && this.activePlayer.isDead) {
       this.deathTimer += deltaTime
       if (this.deathTimer >= DEATH_RESTART_DELAY) {
         if (this.levelIndex === 2) {
@@ -2209,7 +2237,7 @@ export class GameScene extends Scene {
       return
     }
 
-    if (this.activePlayer) {
+    if (!this.paused && this.activePlayer) {
       const localPlayerY = this.activePlayer.container.y - this.currentLevelYOffset
 
       if (this.hintText) this.hintText.visible = false
@@ -2393,13 +2421,20 @@ export class GameScene extends Scene {
 
     const isCoopShared = this.network.getSnapshot().mode === "coop" && this.levelIndex <= 1
 
+    // prevPlayerX/Y нужны и ниже (страж отталкивает игрока назад при
+    // столкновении) ДАЖЕ на паузе — держим их актуальными всегда, а не
+    // только внутри paused-гейта, иначе, если что-то заденет
+    // приостановленного игрока, его откатило бы в (0, 0) вместо текущей
+    // (просто неподвижной) позиции.
     if (this.activePlayer && this.entities.includes(this.activePlayer)) {
+      prevPlayerX = this.activePlayer.container.x
+      prevPlayerY = this.activePlayer.container.y
+    }
+
+    if (!this.paused && this.activePlayer && this.entities.includes(this.activePlayer)) {
       // По id, а не просто по счётчику — в co-op нужно знать, КАКИЕ именно
       // звёзды пропали, чтобы запросить их зачёт у сервера (см. ниже).
       const starsVisibleBefore = new Map(stars.map((star) => [star.id, star.container.visible]))
-
-      prevPlayerX = this.activePlayer.container.x
-      prevPlayerY = this.activePlayer.container.y
 
       this.activePlayer.update(deltaTime, walls, stars)
 

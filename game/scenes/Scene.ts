@@ -17,6 +17,15 @@ export abstract class Scene {
   protected abstract onCreate(): void
   public abstract update(deltaTime: number): void
 
+  /** Пауза (см. Engine.setPaused/GameScene.setPaused) — не абстрактный, а
+   * пустая реализация по умолчанию: не у каждой сцены есть что ставить на
+   * паузу (сейчас единственная сцена — GameScene, но интерфейс общий). */
+  public setPaused(_paused: boolean): void {}
+
+  /** Перезапуск текущего уровня "с нуля" (см. GameScene.restartLevel) — тоже
+   * пустая реализация по умолчанию по той же причине, что и setPaused выше. */
+  public restartLevel(): void {}
+
   public destroy(): void {
     this.onDestroy()
     this.container.destroy({ children: true })
