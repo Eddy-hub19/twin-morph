@@ -1,8 +1,9 @@
-import { Assets, AnimatedSprite, Container, Sprite, Texture } from "pixi.js"
+import { Assets, AnimatedSprite, Container, Graphics, Sprite, Texture } from "pixi.js"
 import { Entity } from "./Entity"
 import { Wall } from "./Wall"
 import { Star } from "./Star"
 import { PlayerCosmetics, type PartnerRole } from "./PlayerCosmetics"
+import type { MaterialKind } from "./Material"
 import {
   ANT_SPEED,
   ANT_DESIRED_HEIGHT,
@@ -12,6 +13,8 @@ import {
   ANT_LEAF_DURATION,
   ANT_LEAF_RISE,
   ANT_ANALOG_DEADZONE,
+  DROWN_FLAIL_DURATION,
+  MATERIAL_SIZE,
 } from "../config/GameConfig"
 
 const DESIRED_HEIGHT = ANT_DESIRED_HEIGHT
@@ -48,13 +51,31 @@ const LEAF_RISE = ANT_LEAF_RISE // px, на сколько листочек вс
 const ANTENNA_TIP_FX = 90 / 100
 const ANTENNA_TIP_FY = (-1 + 10) / 62
 
+// Точка "у щелепах" — ниже и чуть ближе к телу, чем кончик уса (материал,
+// который муравей несёт на уровне пруда/моста, см. setCarriedMaterial).
+const JAWS_FX = 78 / 100
+const JAWS_FY = (20 + 10) / 62
+
 export class Ant extends Entity {
   public isDead = false
+  /** true, если последняя смерть — утопление в пруду (уровень 3, индекс 2):
+   * GameScene по этому флагу решает респавнить муравья на чекпоинте, а не
+   * перезапускать весь уровень/комнату (см. GameScene.update). */
+  public diedFromDrowning = false
 
   private sprite!: AnimatedSprite
   private leafSprite?: Sprite
   private deadTextures: Texture[] = []
   private leafTimer = 0
+
+  /** "Борсается" перед тем, как утонуть (см. drown()) — во время этого
+   * движение/подбор звёзд не обрабатываются, но isDead ещё false (иначе
+   * GameScene тут же посчитал бы муравья мёртвым на первом же кадре). */
+  private isDrowning = false
+  private drownFlailTimer = 0
+
+  private jawsSprite?: Graphics
+  private carriedMaterialKind: MaterialKind | "bigBranch" | null = null
 
   private vx = 0
   private speed = ANT_SPEED
@@ -74,6 +95,7 @@ export class Ant extends Entity {
     // Листочек не должен продолжать всплывать над мёртвым муравьём.
     this.leafTimer = 0
     if (this.leafSprite) this.leafSprite.visible = false
+    if (this.jawsSprite) this.jawsSprite.visible = false
 
     if (!this.sprite || !this.deadTextures.length) return
 
@@ -91,6 +113,23 @@ export class Ant extends Entity {
     }
 
     this.sprite.gotoAndPlay(0)
+  }
+
+  /**
+   * Топит муравья (уровень 3, индекс 2 — пруд без наведённого моста): в
+   * отличие от kill() не убивает мгновенно, а сперва даёт короткое время
+   * "побарсаться" (DROWN_FLAIL_DURATION) — за это время сама update() не
+   * пускает муравья дальше/не даёт подбирать предметы, но isDead ещё false.
+   * По истечении таймера ставит diedFromDrowning и honestly убивает через
+   * тот же kill() (те же dead-кадры), чтобы не дублировать анимацию смерти.
+   */
+  public drown(): void {
+    if (this.isDead || this.isDrowning) return
+
+    this.isDrowning = true
+    this.drownFlailTimer = DROWN_FLAIL_DURATION
+    this.leafTimer = 0
+    if (this.leafSprite) this.leafSprite.visible = false
   }
 
   constructor(input: any, x: number, y: number) {
@@ -145,6 +184,10 @@ export class Ant extends Entity {
     this.leafSprite.visible = false
     this.container.addChild(this.leafSprite)
 
+    this.jawsSprite = new Graphics()
+    this.jawsSprite.visible = false
+    this.container.addChild(this.jawsSprite)
+
     // Без этого isColliding() (используется для звёзд, пузырьков, кнопки
     // сохранения и т.п.) никогда не сработает — Entity.getBounds() строит
     // AABB из container.x/y + width/height, а по умолчанию width/height у
@@ -169,6 +212,68 @@ export class Ant extends Entity {
       x: (ANTENNA_TIP_FX - anchor.x) * texture.width * this.sprite.scale.x,
       y: (ANTENNA_TIP_FY - anchor.y) * texture.height * this.sprite.scale.y,
     }
+  }
+
+  /** Локальные координаты (в системе container) точки "у щелепах" — куда
+   * крепится переносимый материал (лист/ветка/большая ветка), см.
+   * setCarriedMaterial. Тот же приём, что и getAntennaTipOffset. */
+  private getJawsOffset(): { x: number; y: number } {
+    const texture = this.sprite.texture
+    const anchor = this.sprite.anchor
+
+    return {
+      x: (JAWS_FX - anchor.x) * texture.width * this.sprite.scale.x,
+      y: (JAWS_FY - anchor.y) * texture.height * this.sprite.scale.y,
+    }
+  }
+
+  /**
+   * Уровень 3 (индекс 2, пруд/мост): постоянный индикатор "муравей несёт
+   * материал в щелепах", пока GameScene не установит его в слот моста или
+   * не сбросит (утопление) — в отличие от leafSprite/leafTimer выше (та
+   * механика — отдельный, уже существующий "поп" листочка после подбора
+   * звезды, её не трогаем).
+   */
+  public setCarriedMaterial(kind: MaterialKind | "bigBranch" | null): void {
+    this.carriedMaterialKind = kind
+    if (!this.jawsSprite) return
+
+    if (!kind) {
+      this.jawsSprite.visible = false
+      return
+    }
+
+    this.jawsSprite.clear()
+    if (kind === "leaf") {
+      this.jawsSprite.beginFill(0x5cb85c)
+      this.jawsSprite.drawEllipse(0, 0, MATERIAL_SIZE / 2, MATERIAL_SIZE / 2.6)
+      this.jawsSprite.endFill()
+    } else {
+      // "branch" и "bigBranch" рисуются одинаково (просто веточкой) — сама
+      // большая ветка на уровне физически отдельная сущность (BigBranch),
+      // тут лишь визуальный намёк, что муравей тоже её толкает.
+      this.jawsSprite.lineStyle(3, 0x6b4a2b)
+      this.jawsSprite.moveTo(-MATERIAL_SIZE / 2, MATERIAL_SIZE / 4)
+      this.jawsSprite.lineTo(MATERIAL_SIZE / 2, -MATERIAL_SIZE / 4)
+    }
+    this.jawsSprite.visible = true
+  }
+
+  public get carriedMaterial(): MaterialKind | "bigBranch" | null {
+    return this.carriedMaterialKind
+  }
+
+  /** true — муравей сейчас "борсается" после drown() (см. там же): GameScene
+   * не должен запускать новые взаимодействия (подбор/установка материала,
+   * толкание ветки, повторный триггер утопления) в это окно. */
+  public get isFlailing(): boolean {
+    return this.isDrowning
+  }
+
+  private updateCarriedMaterial(): void {
+    if (!this.jawsSprite || !this.jawsSprite.visible) return
+    const tip = this.getJawsOffset()
+    this.jawsSprite.position.set(tip.x, tip.y)
   }
 
   /** Обновляет позицию/прозрачность листочка, подобранного на усик, и гасит его по истечении таймера. */
@@ -206,6 +311,21 @@ export class Ant extends Entity {
     // вызов update() тут же откатит анимацию смерти обратно на кадр покоя
     // веткой "иначе — gotoAndStop(0)" ниже.
     if (this.isDead) return
+
+    if (this.isDrowning) {
+      // Короткая хаотичная хитавиця вместо ходьбы — ничего не подбираем и
+      // никуда не идём, пока не истечёт таймер (см. drown()).
+      this.drownFlailTimer -= deltaTime
+      this.sprite.rotation = Math.sin(this.drownFlailTimer * 40) * 0.25
+
+      if (this.drownFlailTimer <= 0) {
+        this.isDrowning = false
+        this.sprite.rotation = 0
+        this.diedFromDrowning = true
+        this.kill()
+      }
+      return
+    }
 
     this.vx = 0
     let isMoving = false
@@ -255,6 +375,7 @@ export class Ant extends Entity {
     }
 
     this.updateLeaf(deltaTime)
+    this.updateCarriedMaterial()
   }
 
   /**
@@ -264,7 +385,7 @@ export class Ant extends Entity {
    * отрисовать результат — позицию по X и цикл ходьбы по факту смещения.
    */
   public setRemotePosition(x: number): void {
-    if (!this.sprite || this.isDead) return
+    if (!this.sprite || this.isDead || this.isDrowning) return
 
     const dx = x - this.container.x
     const isMoving = Math.abs(dx) > 0.3

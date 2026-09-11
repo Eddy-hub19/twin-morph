@@ -35,6 +35,12 @@ export class GameService {
   private statesByRoom = new Map<string, Map<string, PlayerState>>()
   private latestInputByPlayer = new Map<string, PlayerInput>()
   private formByPlayer = new Map<string, PlayerForm>()
+  /** Номер водного сегмента (уровень 3+), на котором этот игрок сам сейчас
+   * находится — по playerId, а не по комнате (прогресс на воде независим у
+   * каждого, см. WaterSegmentState). Используется только для того, чтобы
+   * отдать позднему присоединению/реконнекту в JoinRoomAck.frogProgress —
+   * подробнее см. GameGateway.handleEnsureWaterSegment. */
+  private frogProgressByPlayer = new Map<string, number>()
   private tickCounter = 0
 
   public ensurePlayerState(roomId: string, playerId: string): PlayerState {
@@ -76,10 +82,21 @@ export class GameService {
     if (state) state.form = form
   }
 
+  /** Игрок дошёл до водного сегмента level (или переподключился уже находясь
+   * на нём) — запоминаем для будущего JoinRoomAck.frogProgress. */
+  public setFrogProgress(playerId: string, level: number): void {
+    this.frogProgressByPlayer.set(playerId, level)
+  }
+
+  public getFrogProgress(playerId: string): number | null {
+    return this.frogProgressByPlayer.get(playerId) ?? null
+  }
+
   public removePlayer(roomId: string, playerId: string): void {
     this.statesByRoom.get(roomId)?.delete(playerId)
     this.latestInputByPlayer.delete(playerId)
     this.formByPlayer.delete(playerId)
+    this.frogProgressByPlayer.delete(playerId)
   }
 
   public removeRoom(roomId: string): void {

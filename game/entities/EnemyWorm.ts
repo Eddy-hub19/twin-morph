@@ -88,6 +88,18 @@ export class EnemyWorm extends Entity {
     if (this.carryIcon) this.carryIcon.visible = Boolean(state.carryingStarId)
   }
 
+  /** Хост комнаты вышел, и мы (бывший гость) стали новым хостом — подхватываем
+   * ИИ с ТЕКУЩЕЙ (уже отрисованной) позиции вместо пересоздания сущности, так
+   * враг не дублируется и не телепортируется. commitTimer сбрасывается в 0,
+   * чтобы на следующем же кадре сразу выбрать курс заново (звезда/домик),
+   * не дожидаясь истечения старого (нерелевантного — мы всё это время не
+   * симулировали сами) таймера. */
+  public resumeLocalControl(): void {
+    this.puppet = false
+    this.commitTimer = 0
+    this.stopDigging()
+  }
+
   /** Хост собирает своё текущее состояние для рассылки гостю. carriedStar
    * передаётся отдельно (id), а не самим объектом Star — сети объекты не нужны. */
   public toNetState(carryingStarId: string | null): EnemyNetState {

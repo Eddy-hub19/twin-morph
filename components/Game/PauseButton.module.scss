@@ -1,0 +1,38 @@
+.button {
+  position: fixed;
+  // Верх-право — не конфликтует ни с RoomStatusBadge (верх-по-центру, см.
+  // ModeSelect.module.scss .roomBadge), ни с сенсорным джойстиком (низ-право,
+  // см. TouchControls.module.scss .joystick).
+  top: max(12px, env(safe-area-inset-top));
+  right: max(12px, env(safe-area-inset-right));
+  z-index: 25; // выше джойстика (10) и roomBadge (15), ниже самого меню паузы (30)
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border-radius: 50%;
+
+  background: rgba(20, 24, 28, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  color: #f5efe6;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+
+  -webkit-tap-highlight-color: transparent;
+
+  &:hover {
+    background: rgba(255, 255, 255, 0.18);
+  }
+
+  // Чуть крупнее на тач-экранах — тем же порогом, что и джойстик/PauseMenu,
+  // легче попасть пальцем.
+  @media (pointer: coarse), (max-width: 820px) {
+    width: 46px;
+    height: 46px;
+    font-size: 20px;
+  }
+}

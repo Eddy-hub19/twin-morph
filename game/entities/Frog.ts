@@ -1,5 +1,6 @@
 import { Assets, AnimatedSprite, Container, Texture } from "pixi.js"
 import { Entity } from "./Entity"
+import { PlayerCosmetics, type PartnerRole } from "./PlayerCosmetics"
 import { FROG_SPEED, FROG_DESIRED_HEIGHT, FROG_ANALOG_DEADZONE } from "../config/GameConfig"
 
 const DESIRED_HEIGHT = FROG_DESIRED_HEIGHT
@@ -18,11 +19,9 @@ const SWIM_FRAME_PATHS = Array.from({ length: SWIM_FRAME_COUNT }, (_, i) => `/as
  * свободно плавает во всей толще воды — движение считается по обеим осям
  * сразу, а не только по X.
  *
- * Сейчас используется только в single player (уровни 4+ пока не участвуют
- * в сетевом co-op протоколе — см. shared/game-protocol.ts PlayerForm); при
- * добавлении жабы в co-op сюда же нужно будет добавить applyRemoteLook/
- * setRemotePosition по образцу Ant, чтобы напарник оставался тем же самым
- * классом Frog, а не отдельным "призрак"-объектом.
+ * В co-op напарник, дошедший до воды, — тот же самый класс Frog (не
+ * отдельный "призрак"-объект), просто ведомый setRemotePosition() вместо
+ * ввода — см. GameScene.upsertRemoteEntity/PlayerForm.
  */
 export class Frog extends Entity {
   public isDead = false
@@ -34,6 +33,9 @@ export class Frog extends Entity {
   private speed = FROG_SPEED
   private input: any
 
+  private readonly cosmetics = new PlayerCosmetics()
+  private spriteReady!: Promise<void>
+
   constructor(input: any, x: number, y: number) {
     super()
     this.container = new Container()
@@ -41,7 +43,15 @@ export class Frog extends Entity {
     this.container.y = y
     this.input = input
 
-    this.setupSprite()
+    this.spriteReady = this.setupSprite()
+  }
+
+  /** Co-op: помечает эту жабу как напарника — контур + аксессуар над головой
+   * (см. PlayerCosmetics), тот же приём, что и Worm.applyRemoteLook/
+   * Ant.applyRemoteLook. Локальный игрок этот метод не вызывает. */
+  public async applyRemoteLook(role: PartnerRole): Promise<void> {
+    await this.spriteReady
+    if (this.sprite) await this.cosmetics.apply(this.sprite, role)
   }
 
   /** Убивает жабу извне — задел на будущее (сейчас на уровне воды ничего не

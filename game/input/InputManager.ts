@@ -11,6 +11,15 @@ export class InputManager {
   private analogY = 0
   private analogActive = false
 
+  /** Пауза (см. GameScene.setPaused): пока false, isDown/isJustPressed/
+   * getAnalogVector возвращают нейтральные значения независимо от реального
+   * состояния клавиш/джойстика — Worm/Ant/Frog ничего не знают про паузу,
+   * они и так лишь читают эти методы, поэтому этого достаточно, чтобы
+   * заблокировать именно локальное управление. Сами события keydown/keyup
+   * по-прежнему копятся в this.keys — снятие паузы не "телепортирует"
+   * игрока по клавише, зажатой всё это время. */
+  private enabled = true
+
   constructor() {
     window.addEventListener("keydown", this.onKeyDown)
     window.addEventListener("keyup", this.onKeyUp)
@@ -26,7 +35,14 @@ export class InputManager {
   }
 
   public isDown(keyCode: string): boolean {
+    if (!this.enabled) return false
     return this.keys.get(keyCode) ?? false
+  }
+
+  /** См. комментарий у поля enabled — вкл./выкл. локальное управление
+   * (пауза). Не трогает сами накопленные состояния клавиш/джойстика. */
+  public setEnabled(enabled: boolean): void {
+    this.enabled = enabled
   }
 
   /**
@@ -57,10 +73,12 @@ export class InputManager {
 
   /** Текущий аналоговый вектор джойстика, или null, если он сейчас не используется. */
   public getAnalogVector(): { x: number; y: number } | null {
+    if (!this.enabled) return null
     return this.analogActive ? { x: this.analogX, y: this.analogY } : null
   }
 
   public isJustPressed(keyCode: string): boolean {
+    if (!this.enabled) return false
     if (this.keys.get(keyCode) && !this.processedKeys.has(keyCode)) {
       this.processedKeys.add(keyCode)
       return true

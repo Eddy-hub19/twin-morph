@@ -9,7 +9,7 @@
 export type GameMode = "solo" | "coop"
 
 /** Форма игрока — от неё зависит скорость (см. PLAYER_SPEED_BY_FORM). */
-export type PlayerForm = "worm" | "ant"
+export type PlayerForm = "worm" | "ant" | "frog"
 
 /**
  * Ввод одного игрока за один кадр — аналоговый вектор (как джойстик/WASD в
@@ -59,16 +59,17 @@ export interface RoomInfo {
 }
 
 // ---------------------------------------------------------------------------
-// Общий мир копания (уровни 0/1) — карта, копание, враги, свет, звёзды.
+// Общий мир копания и поверхности (уровни 0/1/2) — карта, копание, враги,
+// свет, звёзды, а на уровне 2 ещё пруд/мост/матеріали (див. нижче).
 //
-// Уровни 2+ (бег муравья по поверхности) сюда не входят: там нет ни камня,
-// ни звёзд, ни врагов (см. GameScene.generateNextLevel — при level > 1 весь
-// этот спавн уже пропускается в самом клиенте), так что делить их между
-// игроками просто нечего. Вся секция ниже — про то немногое, ЧТО РЕАЛЬНО
-// нужно шарить: seed процедурной генерации (см. shared/rng.ts — оба клиента
-// получают одно и то же число и генерируют побитово одинаковую карту сами,
-// а не пересылают её целиком), диффы уже прогрызенных блоков, кто уже забрал
-// одноразовые предметы (звёзды/пузырьки/факел) и состояние врагов.
+// Уровни 3+ (жаба, вода) сюда не входят и генеруються локально, незалежно у
+// кожного клієнта — це задокументоване обмеження (docs/network.md), поза
+// межами шареного стану. Вся секция ниже — про то, ЧТО РЕАЛЬНО нужно шарить:
+// seed процедурной генерации (см. shared/rng.ts — оба клиента получают одно
+// и то же число и генерируют побитово одинаковую карту сами, а не пересылают
+// её целиком), диффы уже прогрызенных блоков, кто уже забрал одноразовые
+// предметы (звёзды/пузырьки/факел), состояние врагов, а для уровня 2 —
+// матеріали в щелепах і зібрані секції мосту.
 // ---------------------------------------------------------------------------
 
 /** Один вражеский червяк или страж — минимум, нужный, чтобы отрисовать его у
@@ -85,10 +86,10 @@ export interface EnemyNetState {
 }
 
 /**
- * Полное состояние ТЕКУЩЕГО общего уровня комнаты (всегда level 0 или 1 —
- * следующего уровня, пока текущий не пройден оба сразу, попросту не
- * существует). Ровно это возвращается новому/переподключившемуся игроку —
- * "полный текущий снапшот комнаты", а не пустая карта с нуля.
+ * Полное состояние ТЕКУЩЕГО общего уровня комнаты (0, 1 или 2 — следующего
+ * уровня, пока текущий не пройден оба сразу, попросту не существует). Ровно
+ * это возвращается новому/переподключившемуся игроку — "полный текущий
+ * снапшот комнаты", а не пустая карта с нуля.
  */
 export interface RoomLevelState {
   level: number
@@ -120,6 +121,28 @@ export interface RoomLevelState {
    * в отличие от факела/скорости это не таймер, а постоянный бонус уровня. */
   lightRadiusBonus: number
   enemies: EnemyNetState[]
+  /**
+   * Используются только когда level === 2 (уровень муравья с прудом/мостом —
+   * см. GameScene.generateNextLevel) — для level 0/1 это всегда пустые
+   * значения по умолчанию, как и enemies/wallHits для чужих типов уровня.
+   *
+   * materialCarriers: materialId ("2:material:i") -> playerId, который СЕЙЧАС
+   * несёт этот материал в челюстях (запись отсутствует — материал свободен,
+   * лежит на исходном месте спавна или уже установлен в слот). Это и есть
+   * "клейм", не дающий двум игрокам подобрать один и тот же материал разом —
+   * тот же принцип первого-успевшего, что и у collectedItemIds, только не
+   * навсегда: при утоплении носителя клейм снимается (см. LevelStateService.releaseMaterial).
+   */
+  materialCarriers: Record<string, string>
+  /** bridgeSlots: slotId ("2:slot:i") -> materialId, окончательно установленный
+   * в этот слот моста (запись отсутствует — слот ещё пуст). В отличие от
+   * materialCarriers это уже необратимо — слот не освобождается назад. */
+  bridgeSlots: Record<string, string>
+  /** Общий прогресс переноса большой ветки к финальному слоту (0..1, никогда
+   * не сбрасывается назад) и id игроков, которые её сейчас толкают — считает
+   * ТОЛЬКО хост комнаты (по тому же принципу, что и enemies выше), сервер
+   * лишь хранит последнее известное значение. */
+  bigBranch: { progress: number; carrierIds: string[] }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +176,12 @@ export interface JoinRoomAck {
    * Это и есть "полный текущий снапшот" для новых/переподключившихся
    * игроков — им не нужно генерировать level 0 с нуля вслепую. */
   levelState?: RoomLevelState | null
+  /** Номер водного сегмента (уровень 3+), на котором ЭТОТ игрок сам был в
+   * последний раз (по playerId, не по комнате — прогресс на воде у каждого
+   * свой) — null/undefined, если он никогда не доплывал до воды. Позволяет
+   * позднему присоединению/реконнекту сразу заспавниться жабой на нужном
+   * сегменте, минуя кат-сцену метаморфозы (см. GameScene.startCoopLevel). */
+  frogProgress?: number | null
 }
 
 export interface EnsureLevelPayload {
@@ -269,6 +298,101 @@ export interface EnemyStatePayload {
   enemies: EnemyNetState[]
 }
 
+// ---------------------------------------------------------------------------
+// Уровни 3+ (жаба, вода) — в отличие от уровней 0/1/2 выше, тут НЕТ единого
+// "текущего уровня комнаты": прогресс каждого игрока независим (никакой
+// общей "двери", которую нужно проходить обоим сразу, тут не существует —
+// каждый доплывает до края своего экрана и переходит на следующий сегмент
+// сам, в своём темпе). Поэтому вместо одного replace-on-advance слота (как
+// RoomLevelState) — независимое, растущее хранилище НА КАЖДЫЙ номер уровня:
+// кто первый из игроков комнаты доплыл до сегмента N — тот и закрепляет его
+// seed/размер (см. LevelStateService.ensureWaterSegment), второй игрок,
+// доплыв туда позже (или после реконнекта), получает ТЕ ЖЕ значения, а не
+// генерирует свои. Больше тут шарить нечего — на воде нет ни стен, ни
+// звёзд, ни врагов.
+// ---------------------------------------------------------------------------
+
+/** Полное состояние одного водного сегмента (уровня 3+) — минимальный аналог
+ * RoomLevelState для этой части игры. */
+export interface WaterSegmentState {
+  level: number
+  seed: number
+  /** Ширина/высота сегмента — решается ОДИН раз на всю водную фазу комнаты
+   * (тем игроком, кто первым запросил хоть один водный сегмент), как и
+   * RoomLevelState.width/height для уровней 0/1 — иначе разъедутся мировые
+   * координаты между клиентами с разным размером экрана. */
+  width: number
+  height: number
+}
+
+export interface EnsureWaterSegmentPayload {
+  roomId: string
+  level: number
+  width: number
+  height: number
+}
+
+export interface EnsureWaterSegmentAck {
+  ok: boolean
+  segment?: WaterSegmentState
+}
+
+// ---------------------------------------------------------------------------
+// Уровень 2 (муравей, пруд/міст) — матеріали в щелепах і велика гілка. Той
+// самий "перший встиг — клеймить" принцип, що і starPickup/boostActivate
+// вище, тільки клейм НЕ навічно (матеріал можна впустити при утопленні —
+// див. materialRelease) — на відміну від collectedItemIds, що назавжди.
+// ---------------------------------------------------------------------------
+
+export interface MaterialGrabPayload {
+  roomId: string
+  level: number
+  epoch: number
+  materialId: string
+}
+
+export interface MaterialGrabAck {
+  ok: boolean
+}
+
+export interface MaterialUpdatedPayload {
+  level: number
+  epoch: number
+  materialId: string
+  /** null — матеріал знову вільний (впав при утопленні носія), інакше — id
+   * гравця, який щойно його підібрав. */
+  carrierId: string | null
+}
+
+export interface MaterialInstallPayload {
+  roomId: string
+  level: number
+  epoch: number
+  materialId: string
+  slotId: string
+}
+
+export interface MaterialInstallAck {
+  ok: boolean
+}
+
+export interface SlotUpdatedPayload {
+  level: number
+  epoch: number
+  slotId: string
+  materialId: string
+}
+
+/** Тільки хост кімнати реально рахує/шле це (як enemyState) — сервер лише
+ * зберігає останнє відоме значення для нового/перепідключеного гравця. */
+export interface BigBranchStatePayload {
+  roomId: string
+  level: number
+  epoch: number
+  progress: number
+  carrierIds: string[]
+}
+
 export interface PlayerTransformPayload {
   playerId: string
   form: PlayerForm
@@ -334,6 +458,19 @@ export interface ClientToServerEvents {
   /** Периодически шлёт только "хост" комнаты (см. game/network — первый по
    * RoomInfo.players) — сервер лишь ретранслирует остальным, не пересчитывает. */
   enemyState: (payload: EnemyStatePayload) => void
+  // -- Уровень 2 (пруд/міст), див. секцію вище --
+  materialGrab: (payload: MaterialGrabPayload, ack: (response: MaterialGrabAck) => void) => void
+  materialRelease: (payload: MaterialGrabPayload) => void
+  materialInstall: (payload: MaterialInstallPayload, ack: (response: MaterialInstallAck) => void) => void
+  /** Шле лише хост (як enemyState) — сервер лише зберігає останнє значення. */
+  bigBranchState: (payload: BigBranchStatePayload) => void
+  // -- Уровни 3+ (жаба, вода), см. секцию WaterSegmentState выше --
+  /** "Дай канонический seed/размер водного сегмента level, а если для него
+   * ещё никто не спрашивал — закрепи мои предложенные width/height прямо
+   * сейчас". В отличие от ensureLevel/advanceLevel — НЕ требует, чтобы вся
+   * комната была на одном номере уровня: у каждого игрока свой независимый
+   * прогресс по воде (см. LevelStateService.ensureWaterSegment). */
+  ensureWaterSegment: (payload: EnsureWaterSegmentPayload, ack: (response: EnsureWaterSegmentAck) => void) => void
 }
 
 export interface ServerToClientEvents {
@@ -351,6 +488,9 @@ export interface ServerToClientEvents {
   lightUpdate: (payload: LightUpdatePayload) => void
   boostUpdate: (payload: BoostUpdatePayload) => void
   enemyState: (payload: EnemyStatePayload) => void
+  materialUpdated: (payload: MaterialUpdatedPayload) => void
+  slotUpdated: (payload: SlotUpdatedPayload) => void
+  bigBranchState: (payload: BigBranchStatePayload) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +512,7 @@ export const RECONNECT_GRACE_MS = 30_000
 export const PLAYER_SPEED_BY_FORM: Record<PlayerForm, number> = {
   worm: 150,
   ant: 250,
+  frog: 150,
 }
 
 // ---------------------------------------------------------------------------
@@ -390,8 +531,10 @@ export const SHARED_LIGHT_DURATION_MS = 60_000
 /** Сколько миллисекунд действует пузырёк скорости. */
 export const SHARED_SPEED_BOOST_DURATION_MS = 15_000
 
-/** Во сколько раз пузырёк скорости ускоряет игрока, пока действует. */
-export const SHARED_SPEED_BOOST_MULTIPLIER = 2
+/** Во сколько раз пузырёк скорости ускоряет игрока, пока действует. Раньше
+ * было 2 (полное удвоение скорости) — многовато, снижено до 1.5. Длительность
+ * эффекта (SHARED_SPEED_BOOST_DURATION_MS выше) при этом не менялась. */
+export const SHARED_SPEED_BOOST_MULTIPLIER = 1.5
 
 /** Постоянная добавка к радиусу света от одного пузырька света. */
 export const SHARED_LIGHT_RADIUS_BONUS = 45
