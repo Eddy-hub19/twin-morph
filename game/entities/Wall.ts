@@ -28,6 +28,14 @@ export class Wall extends Entity {
    * применяет ЧУЖОЙ удар и флаг не трогает, чтобы не заэхивать его обратно в сеть. */
   public justHit = false
 
+  /** Колбэк, вызываемый ИЗ hit() сразу же, как только блок получил удар — им
+   * GameScene подписывается один раз при индексации (см. GameScene.
+   * indexEntity/dirtyWalls, hotfix/gameplay-performance), чтобы раз в кадр
+   * вычерпывать именно ударенные блоки, а не сканировать все стены уровня в
+   * поисках justHit. Необязателен — Wall, созданный без GameScene (тесты и
+   * т.п.), продолжает работать как раньше, просто без этого репорта. */
+  public onDirty?: (wall: Wall) => void
+
   constructor(x: number, y: number, width: number, height: number, type: WallType = "dirt", cellKey?: string) {
     super()
     this.type = type
@@ -108,6 +116,7 @@ export class Wall extends Entity {
 
     this.hitPoints = Math.max(this.hitPoints - 1, 0)
     this.justHit = true
+    this.onDirty?.(this)
 
     if (this.hitPoints <= 0) {
       this.container.visible = false
@@ -141,18 +150,25 @@ export class Wall extends Entity {
 }
 
 /**
+ * O(1)-поиск стены "под точкой" (см. GameScene.wallByCellKey/wallLookup,
+ * hotfix/gameplay-performance) — раньше findWallAt/isPointBlocked получали
+ * ВЕСЬ массив стен уровня и линейно сканировали его (Array.find) на КАЖДОЕ
+ * движение червя/врага/стража, каждый кадр. Стены levels 0/1 (единственные,
+ * где вообще проверяются столкновения — см. GameScene.generateNextLevel)
+ * всегда выровнены по сетке cellSize, поэтому точка однозначно попадает
+ * ровно в одну ячейку — get(x, y) сводится к одному Map.get() у вызывающего
+ * кода (см. GameScene.wallLookup), без единого прохода по массиву.
+ */
+export interface WallLookup {
+  get(x: number, y: number): Wall | undefined
+}
+
+/**
  * Видимая (ещё не прогрызенная) стена, в которую попадает точка (x, y), —
  * или undefined, если там туннель.
  */
-export function findWallAt(walls: Wall[], x: number, y: number): Wall | undefined {
-  return walls.find(
-    (wall) =>
-      wall.container.visible &&
-      x >= wall.container.x &&
-      x < wall.container.x + wall.width &&
-      y >= wall.container.y &&
-      y < wall.container.y + wall.height,
-  )
+export function findWallAt(lookup: WallLookup, x: number, y: number): Wall | undefined {
+  return lookup.get(x, y)
 }
 
 /**
@@ -160,6 +176,6 @@ export function findWallAt(walls: Wall[], x: number, y: number): Wall | undefine
  * стены — то есть это "твёрдая земля", а не туннель. Используется, чтобы
  * не пускать вражеских червяков сквозь непрокопанные блоки.
  */
-export function isPointBlocked(walls: Wall[], x: number, y: number): boolean {
-  return findWallAt(walls, x, y) !== undefined
+export function isPointBlocked(lookup: WallLookup, x: number, y: number): boolean {
+  return findWallAt(lookup, x, y) !== undefined
 }

@@ -5,7 +5,12 @@ export abstract class Entity {
   public width: number = 0
   public height: number = 0
 
-  public abstract update(deltaTime: number, walls?: any[], stars?: any[]): void
+  // walls/stars — не типизированы конкретно здесь специально: разным
+  // сущностям нужны разные вещи (Worm/EnemyWorm/GuardWorm — WallLookup для
+  // O(1)-поиска стены под точкой, см. entities/Wall.ts; большинству
+  // остальных — вообще ничего, их update() пуст). Базовый класс намеренно
+  // не знает о конкретных типах, чтобы не тянуть их сюда через импорт.
+  public abstract update(deltaTime: number, walls?: unknown, stars?: unknown): void
 
   public getBounds() {
     return {

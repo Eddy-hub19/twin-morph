@@ -1,7 +1,7 @@
 import { Assets, Graphics, Sprite, Texture } from "pixi.js"
 import { Entity } from "./Entity"
 import { Star } from "./Star"
-import { Wall, findWallAt } from "./Wall"
+import { type Wall, findWallAt, type WallLookup } from "./Wall"
 import type { EnemyNetState } from "../../shared/game-protocol"
 import {
   ENEMY_SPEED,
@@ -138,7 +138,7 @@ export class EnemyWorm extends Entity {
     this.container.addChild(this.carryIcon)
   }
 
-  public update(deltaTime: number, walls: Wall[] = [], stars: Star[] = []): void {
+  public update(deltaTime: number, wallLookup: WallLookup, stars: Star[] = []): void {
     if (!this.sprite) {
       return
     }
@@ -183,7 +183,7 @@ export class EnemyWorm extends Entity {
           this.heading = targetAngle
         }
       } else {
-        this.pickOpenHeading(walls)
+        this.pickOpenHeading(wallLookup)
       }
 
       const commitMin = this.carriedStar ? COMMIT_MIN * CARRY_COMMIT_MULTIPLIER : COMMIT_MIN
@@ -191,13 +191,13 @@ export class EnemyWorm extends Entity {
       this.commitTimer = commitMin + Math.random() * (commitMax - commitMin)
     }
 
-    const result = this.step(walls, deltaTime)
+    const result = this.step(wallLookup, deltaTime)
 
     if (result === "blocked") {
       // Камень или край уровня — напролом не пройти. Ищем обходной курс и
       // держимся его (сбрасываем таймер), а не дёргаемся обратно к цели на
       // следующем же кадре — это и вызывало дрожание.
-      if (this.pickOpenHeading(walls)) {
+      if (this.pickOpenHeading(wallLookup)) {
         this.commitTimer = COMMIT_MIN + Math.random() * (COMMIT_MAX - COMMIT_MIN)
       }
     }
@@ -237,7 +237,7 @@ export class EnemyWorm extends Entity {
    * или вышли за границу зоны уровня — сообщаем "blocked" (сами не
    * разворачиваемся, это решает вызывающий код).
    */
-  private step(walls: Wall[], deltaTime: number): StepResult {
+  private step(wallLookup: WallLookup, deltaTime: number): StepResult {
     const speed = this.carriedStar ? this.speed * CARRY_SPEED_MULTIPLIER : this.speed
     const distance = speed * deltaTime
     const nextX = this.container.x + Math.cos(this.heading) * distance
@@ -245,7 +245,7 @@ export class EnemyWorm extends Entity {
 
     const margin = ENEMY_AREA_MARGIN
     const outOfBounds = nextY < this.areaTop + margin || nextY > this.areaTop + this.areaHeight - margin
-    const obstacle = outOfBounds ? undefined : findWallAt(walls, nextX, nextY)
+    const obstacle = outOfBounds ? undefined : findWallAt(wallLookup, nextX, nextY)
 
     if (outOfBounds || obstacle?.type === "stone" || obstacle?.type === "bedrock") {
       this.stopDigging()
@@ -289,12 +289,12 @@ export class EnemyWorm extends Entity {
   }
 
   /** Занята ли точка камнем или бедроком (настоящее препятствие для щупов). */
-  private isImpassable(walls: Wall[], x: number, y: number): boolean {
+  private isImpassable(wallLookup: WallLookup, x: number, y: number): boolean {
     const margin = ENEMY_AREA_MARGIN
     if (y < this.areaTop + margin || y > this.areaTop + this.areaHeight - margin) {
       return true
     }
-    const type = findWallAt(walls, x, y)?.type
+    const type = findWallAt(wallLookup, x, y)?.type
     return type === "stone" || type === "bedrock"
   }
 
@@ -304,13 +304,13 @@ export class EnemyWorm extends Entity {
    * препятствием — её всё равно можно прогрызть). Короткая дистанция щупа —
    * чтобы не выбрать курс, ведущий прямиком в камень через пару шагов.
    */
-  private pickOpenHeading(walls: Wall[]): boolean {
+  private pickOpenHeading(wallLookup: WallLookup): boolean {
     for (let attempt = 0; attempt < 12; attempt++) {
       const angle = Math.random() * Math.PI * 2
       const probeX = this.container.x + Math.cos(angle) * PROBE_DISTANCE
       const probeY = this.container.y + Math.sin(angle) * PROBE_DISTANCE
 
-      if (!this.isImpassable(walls, probeX, probeY)) {
+      if (!this.isImpassable(wallLookup, probeX, probeY)) {
         this.heading = angle
         return true
       }

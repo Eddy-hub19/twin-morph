@@ -1,7 +1,7 @@
 import { AnimatedSprite, Assets, type Spritesheet, type Texture } from "pixi.js"
 import { Entity } from "./Entity"
 import { InputManager } from "../input/InputManager"
-import { Wall } from "./Wall"
+import { findWallAt, type Wall, type WallLookup } from "./Wall"
 import { Star } from "./Star"
 import { PlayerCosmetics, type PartnerRole } from "./PlayerCosmetics"
 import { WORM_SPEED, WORM_DIG_HIT_INTERVAL } from "../config/GameConfig"
@@ -69,7 +69,7 @@ export class Worm extends Entity {
     this.container.addChild(this.sprite)
   }
 
-  public update(deltaTime: number, walls: Wall[] = [], stars: Star[] = []): void {
+  public update(deltaTime: number, wallLookup: WallLookup, stars: Star[] = []): void {
     if (this.animationState === "dead") {
       return
     }
@@ -129,7 +129,7 @@ export class Worm extends Entity {
     // ровной линии) — тогда бокс задевает сразу два соседних блока и оба
     // прогрызаются за пару кадров. Точка же всегда принадлежит ровно одной
     // клетке, поэтому за один шаг может быть прогрызен только один блок.
-    const hitWall = this.findWallAtPoint(walls, nextX, nextY)
+    const hitWall = findWallAt(wallLookup, nextX, nextY)
 
     if (hitWall) {
       if (hitWall.type === "stone") {
@@ -241,20 +241,6 @@ export class Worm extends Entity {
 
     this.diggingWall = undefined
     this.digProgress = 0
-  }
-
-  private findWallAtPoint(walls: Wall[], x: number, y: number): Wall | undefined {
-    return walls.find(
-      (wall) =>
-        wall.container.visible &&
-        // Полуоткрытый интервал [left, right): точка ровно на границе сетки
-        // всегда принадлежит только одной клетке — той, что начинается в этой
-        // точке, а не той, что в ней заканчивается.
-        x >= wall.container.x &&
-        x < wall.container.x + wall.width &&
-        y >= wall.container.y &&
-        y < wall.container.y + wall.height,
-    )
   }
 
   private applyAnimation(state: AnimationState): void {

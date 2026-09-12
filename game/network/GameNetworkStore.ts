@@ -165,8 +165,34 @@ export class GameNetworkStore {
     return this.cachedSnapshot
   }
 
+  /**
+   * update()/reportLocalPose() (позиция локального игрока) и handleSnapshot()
+   * (позиции всех игроков от сервера) зовут notify() КАЖДЫЙ КАДР — 60 раз в
+   * секунду — хотя NetworkSnapshot вообще не содержит позиций (см.
+   * computeSnapshot: только mode/connectionStatus/roomInfo/localPlayerId).
+   * Раньше notify() безусловно пересоздавал this.cachedSnapshot новым
+   * объектом и звал слушателей — useSyncExternalStore сравнивает снапшот по
+   * ссылке (Object.is), так что любой React-компонент, подписанный через
+   * useGameSocket() (см. hooks/useGameSocket.ts), ре-рендерился каждый кадр,
+   * даже если ни одно из этих четырёх полей на самом деле не изменилось.
+   * Теперь снапшот пересоздаётся (и слушатели зовутся) только когда что-то
+   * из них реально другое — Pixi-игровой цикл (GameScene) по-прежнему читает
+   * позиции напрямую из this.localState/remoteBuffers, минуя React вообще.
+   */
   private notify(): void {
-    this.cachedSnapshot = this.computeSnapshot()
+    const next = this.computeSnapshot()
+    const prev = this.cachedSnapshot
+
+    if (
+      prev.mode === next.mode &&
+      prev.connectionStatus === next.connectionStatus &&
+      prev.roomInfo === next.roomInfo &&
+      prev.localPlayerId === next.localPlayerId
+    ) {
+      return
+    }
+
+    this.cachedSnapshot = next
     for (const listener of this.listeners) listener()
   }
 
