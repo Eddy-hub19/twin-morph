@@ -31,6 +31,8 @@ import type {
   RoomRestartRequestPayload,
   StarPickupPayload,
   WallHitPayload,
+  WaterItemPickupPayload,
+  WaterPassageEnterPayload,
 } from "../../../shared/game-protocol"
 import { RoomService } from "./room.service"
 import { GameService } from "./game.service"
@@ -112,6 +114,7 @@ export class GameGateway implements OnGatewayInit, OnGatewayDisconnect {
       teamStars: this.levelState.getTeamStars(room.roomId),
       levelState: this.levelState.getLevelState(room.roomId),
       frogProgress: this.gameService.getFrogProgress(player.playerId),
+      waterLevelState: this.levelState.getWaterSegmentState(room.roomId, 3),
     }
   }
 
@@ -142,6 +145,39 @@ export class GameGateway implements OnGatewayInit, OnGatewayDisconnect {
     this.gameService.setFrogProgress(playerId, payload.level)
 
     return { ok: true, segment }
+  }
+
+  /** Уровень 3 — подобрал кувшинку/ключ (навсегда для всей комнаты, тот же
+   * принцип, что и starPickup выше). */
+  @SubscribeMessage("waterItemPickup")
+  public handleWaterItemPickup(@ConnectedSocket() client: GameSocket, @MessageBody() payload: WaterItemPickupPayload): void {
+    const roomId = client.data.roomId
+    if (!roomId || roomId !== payload.roomId) return
+
+    const result = this.levelState.collectWaterItem(roomId, payload.level, payload.itemId, payload.isKey)
+    if (!result) return // уже собран кем-то раньше — не даём засчитать дважды
+
+    this.server.to(roomId).emit("waterItemCollected", {
+      level: payload.level,
+      itemId: payload.itemId,
+      isKey: payload.isKey,
+      keyFound: result.keyFound,
+    })
+  }
+
+  /** Уровень 3 — коснулся уже открытого прохода: заводит RoomLevelState
+   * уровня 4 и рассылает его ОБОИМ игрокам комнаты сразу — единственный
+   * момент во всей водной фазе, где снова нужен общий "переход для всех",
+   * см. комментарий у WaterSegmentState в shared/game-protocol.ts. */
+  @SubscribeMessage("waterPassageEnter")
+  public handleWaterPassageEnter(@ConnectedSocket() client: GameSocket, @MessageBody() payload: WaterPassageEnterPayload): void {
+    const roomId = client.data.roomId
+    if (!roomId || roomId !== payload.roomId) return
+
+    const levelState = this.levelState.enterWaterPassage(roomId, payload.level, payload.width, payload.height)
+    if (!levelState) return // ключ ещё не найден (клиенту не доверяем) или проход уже пройден раньше
+
+    this.server.to(roomId).emit("waterPassageEntered", { levelState })
   }
 
   /** Игрок дошёл до двери с полным общим счётом звёзд — переводит ВСЮ

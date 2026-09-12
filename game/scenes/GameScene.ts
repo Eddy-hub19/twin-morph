@@ -20,6 +20,9 @@ import { Material, type MaterialKind } from "../entities/Material"
 import { BridgeSlot } from "../entities/BridgeSlot"
 import { BigBranch } from "../entities/BigBranch"
 import { Checkpoint } from "../entities/Checkpoint"
+import { LilyPad } from "../entities/LilyPad"
+import { Key } from "../entities/Key"
+import { SubmergedPassage } from "../entities/SubmergedPassage"
 import { GameNetworkStore } from "../network/GameNetworkStore"
 import type { InputManager } from "../input/InputManager"
 import type { EnemyNetState, LevelAdvancedPayload, PlayerForm, PlayerState, RoomLevelState, RoomRestartPayload } from "../../shared/game-protocol"
@@ -53,6 +56,7 @@ import {
   DEATH_RESTART_DELAY,
   FOG_BASE_LIGHT_RADIUS,
   FOG_LIGHT_RADIUS_PER_BUBBLE,
+  FOG_LIGHT_RADIUS_SMOOTHING,
   FOG_SOFT_EDGE,
   FOG_SIZE_MULTIPLIER,
   REVEAL_DURATION,
@@ -70,6 +74,12 @@ import {
   POND_DROWN_GRACE,
   FROG_FOCUS_ZOOM_SCALE,
   FROG_EDGE_MARGIN,
+  VERTICAL_WATER_HEIGHT_MULTIPLIER,
+  LILY_PAD_COUNT,
+  LILY_PAD_SURFACE_BAND_HEIGHT,
+  SUBMERGED_PASSAGE_WIDTH,
+  SUBMERGED_PASSAGE_HEIGHT,
+  SUBMERGED_PASSAGE_BOTTOM_MARGIN,
   PARTNER_ARROW_MARGIN,
   PARTNER_ARROW_TOP_MARGIN,
   PARTNER_ARROW_SMOOTHING,
@@ -219,13 +229,15 @@ export class GameScene extends Scene {
   private pondLevelWidth = 0
   private pondLevelHeight = 0
 
-  // Уровни 3+ (жаба, вода) — тот же принцип, что и pondLevelWidth/Height
-  // выше, только прогресс на воде независим у каждого игрока (нет единой
-  // "двери", которую нужно пройти обоим сразу — см. shared/game-protocol.ts
-  // WaterSegmentState): каждый клиент сам просит канонический размер/seed
-  // очередного сегмента у сервера, когда до него доплывает (см.
+  // Уровень 3 (жаба, единственный водный уровень — большой вертикальный
+  // водоём) — тот же принцип, что и pondLevelWidth/Height выше (свой размер,
+  // не связанный с диг-уровнями), только высота ЗАМЕТНО больше обычного
+  // экрана (см. VERTICAL_WATER_HEIGHT_MULTIPLIER) — есть куда всплывать/
+  // нырять. Вход в сам уровень 3 по-прежнему независим у каждого игрока (см.
+  // shared/game-protocol.ts WaterSegmentState) — каждый клиент сам просит
+  // канонический размер/seed у сервера, когда до него доплывает (см.
   // prepareWaterSegment). 0 — ещё не согласовано (co-op) или single player —
-  // тогда generateNextLevel подставляет window.innerWidth/Height, как и раньше.
+  // тогда generateNextLevel подставляет запасной window.innerWidth/Height * множитель.
   private waterLevelWidth = 0
   private waterLevelHeight = 0
   /** true, пока идёт (единственный) запрос ensureWaterSegment для очередного
@@ -233,15 +245,45 @@ export class GameScene extends Scene {
    * ожидание широковещательного события (партнёр может быть на совсем
    * другом сегменте), а просто свой собственный round-trip до сервера. */
   private pendingWaterSegment = false
+  /** true, как только КТО-ТО (в single player — только сам игрок) нашёл ключ
+   * на уровне 3 — открывает SubmergedPassage навсегда (см. update()). */
+  private keyFound = false
+  /** Не даёт requestWaterPassageEnter уйти повторно каждый кадр, пока сервер
+   * не ответил широковещательным waterPassageEntered (тот же принцип, что и
+   * pendingWaterSegment выше). */
+  private pendingWaterPassageEnter = false
+  /** RoomLevelState уровня 4, уже присланный сервером вместе с
+   * waterPassageEntered (co-op) — handleMetamorphosis (TRANSFORM, Frog ->
+   * Worm) применяет его вместо локальной генерации, чтобы оба игрока
+   * получили один и тот же seed/размер уровня 4. null в single player —
+   * там уровень 4 просто генерируется на месте, без сервера. */
+  private pendingLevel4State: RoomLevelState | null = null
+  /** Тот же принцип, что и pendingWaterSegment/pendingWaterPassageEnter —
+   * держит TRANSFORM (Frog -> Worm) от повторного запуска new Worm()/
+   * generateNextLevel(4) на каждом кадре, пока грузится спрайт нового червяка
+   * (см. Worm.init() — асинхронный, в отличие от Ant/Frog). */
+  private pendingWormInit = false
 
   // Туман войны: вокруг червя — светлый круг, дальше — темнота. Копаем вслепую.
   private fogContainer = new Container()
   private fogSprite?: Sprite
   private fogSize = 3000
   private readonly baseLightRadius = FOG_BASE_LIGHT_RADIUS
+  // lightRadius — то, что реально нарисовано на экране прямо сейчас;
+  // targetLightRadius — то, к чему он плавно едет (updateLightRadius). Пузырёк
+  // света просто сдвигает цель, а не радиус напрямую — иначе свет прыгал бы
+  // мгновенно, как раньше.
   private lightRadius = this.baseLightRadius
+  private targetLightRadius = this.baseLightRadius
+  private readonly lightRadiusSmoothing = FOG_LIGHT_RADIUS_SMOOTHING
   private readonly lightRadiusPerBubble = FOG_LIGHT_RADIUS_PER_BUBBLE
   private readonly lightSoftEdge = FOG_SOFT_EDGE
+  // Радиус, "запечённый" в текущую текстуру тумана (buildFogTexture). Между
+  // перестройками текстуры (редкими: старт/рестарт уровня, догоняющий
+  // снапшот) реальный рост радиуса от пузырьков рисуем просто масштабом
+  // fogSprite = lightRadius / fogTextureRadius — на порядок дешевле, чем
+  // перерисовывать многотысячный canvas на каждый кадр анимации.
+  private fogTextureRadius = this.baseLightRadius
 
   // Факел-выключатель: подобрал — минуту вся карта видна без тумана.
   private readonly revealDuration = REVEAL_DURATION
@@ -303,11 +345,16 @@ export class GameScene extends Scene {
     this.carriedMaterialId = null
     this.carriedMaterialKind = null
     this.lightRadius = this.baseLightRadius
+    this.targetLightRadius = this.baseLightRadius
     this.revealTimer = 0
     this.speedBoostTimer = 0
     this.pendingAdvanceLevel = false
     this.pendingRoomRestart = false
     this.pendingWaterSegment = false
+    this.keyFound = false
+    this.pendingWaterPassageEnter = false
+    this.pendingLevel4State = null
+    this.pendingWormInit = false
     this.lastCarriedStarByEnemy.clear()
     // Текст факела-выключателя переживал рестарт уровня: revealTimer тут
     // выше уже честно обнулён, но сам HUD-текст (тот же Text-объект, что и
@@ -399,6 +446,19 @@ export class GameScene extends Scene {
    * onCreate() — single player (см. выше) целиком синхронный, как и раньше.
    */
   private async startCoopLevel(): Promise<void> {
+    // Комната уже прошла подводный проход (кто-то из игроков открыл его
+    // раньше нас — см. LevelStateService.enterWaterPassage) — level уровня 4
+    // сервер к этому моменту уже держит как обычный RoomLevelState (levelByRoom),
+    // поэтому ensureLevel(0, ...) ниже (который просто вернул бы ЕГО же) не
+    // нужен: сразу спавним честным червяком на уровне 4, минуя всю
+    // кат-сцену/воду целиком — тот же принцип "прыжок сразу на актуальный
+    // прогресс", что и у frogProgress ниже.
+    const existingLevelState = this.network.getLevelState()
+    if (existingLevelState?.level === 4) {
+      await this.startCoopWormLevel4(existingLevelState)
+      return
+    }
+
     // Late-join/reconnect, когда МЫ САМИ (по своему playerId, см.
     // JoinRoomAck.frogProgress) уже доплывали до воды — сразу жаба на
     // актуальном сегменте, минуя кат-сцену метаморфозы и всю диг/пруд-фазу
@@ -500,15 +560,51 @@ export class GameScene extends Scene {
     this.levelIndex = level
 
     this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
+    this.applyWaterLevelCatchUp()
 
-    const frogY = this.currentLevelYOffset + window.innerHeight / 2
-    const frogX = this.currentLevelXOffset + 60
+    // Жаба всплывает/ныряет по вертикали в этом (единственном, заметно более
+    // высоком) водном уровне — спавнится у самого дна, у подводного прохода,
+    // а не по центру: та же логика, что и в handleMetamorphosis (Ant -> Frog).
+    const frogY = this.currentLevelYOffset + this.waterLevelHeight - SUBMERGED_PASSAGE_HEIGHT - SUBMERGED_PASSAGE_BOTTOM_MARGIN - 60
+    const frogX = this.currentLevelXOffset + window.innerWidth / 2
     const frog = new Frog(this.input, frogX, frogY)
     this.activePlayer = frog
     this.addEntity(frog)
 
     this.worldContainer.scale.set(this.frogFocusZoomScale)
     this.worldContainer.pivot.set(frogX, frogY)
+    this.worldContainer.position.set(window.innerWidth / 2, window.innerHeight / 2)
+  }
+
+  /**
+   * Late-join/reconnect, когда комната уже открыла подводный проход и
+   * перешла на уровень 4 (см. проверку в startCoopLevel выше) — сразу честный
+   * червяк на уровне 4, минуя всю кат-сцену/воду/подземелье целиком. Точное
+   * X/Y-смещение уровня 4 (зависящее от того, какой реальной высоты был
+   * пройденный уровень 3 у ПЕРВОГО игрока, открывшего проход) не восстановить
+   * без честного прохождения — ставим новый, заведомо свободный от всего
+   * остального блок координат, тем же принципом "разумного приближения", что
+   * и у startCoopFrogLevel выше.
+   */
+  private async startCoopWormLevel4(levelState: RoomLevelState): Promise<void> {
+    this.prepareRoomLevel(levelState, this.network.getEpoch())
+    this.currentLevelYOffset = -(this.digLevelHeight() * 2 + window.innerHeight * VERTICAL_WATER_HEIGHT_MULTIPLIER)
+    this.currentLevelXOffset = 0
+
+    this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
+
+    const worm = new Worm(this.input)
+    this.activePlayer = worm
+
+    await worm.init()
+    if (this.destroyed) return
+
+    worm.container.x = this.currentLevelXOffset + this.roomLevelWidth / 2
+    worm.container.y = this.currentLevelYOffset + 60
+    this.addEntity(worm)
+
+    this.worldContainer.scale.set(this.wormFocusZoomScale)
+    this.worldContainer.pivot.set(worm.container.x, worm.container.y)
     this.worldContainer.position.set(window.innerWidth / 2, window.innerHeight / 2)
   }
 
@@ -542,6 +638,12 @@ export class GameScene extends Scene {
       // размер уровня 2 не связан с увеличенным digLevelWidth/Height 0/1.
       this.pondLevelWidth = levelState.width
       this.pondLevelHeight = levelState.height
+    } else if (levelState.level === 4) {
+      // level === 4 переиспользует те же поля, что и 0/1 (см. комментарий у
+      // width/height в generateNextLevel) — тот же digLevelWidth()/Height()
+      // принцип синхронизации размера для co-op.
+      this.roomLevelWidth = levelState.width
+      this.roomLevelHeight = levelState.height
     }
     this.roomEpoch = epoch
     this.levelIndex = levelState.level
@@ -560,7 +662,8 @@ export class GameScene extends Scene {
   private async prepareWaterSegment(level: number): Promise<void> {
     if (this.network.getSnapshot().mode !== "coop") return
 
-    const segment = await this.network.ensureWaterSegment(level, this.waterLevelWidth || window.innerWidth, this.waterLevelHeight || window.innerHeight)
+    const preferredHeight = this.waterLevelHeight || window.innerHeight * VERTICAL_WATER_HEIGHT_MULTIPLIER
+    const segment = await this.network.ensureWaterSegment(level, this.waterLevelWidth || window.innerWidth, preferredHeight)
     if (!segment) return
 
     this.waterLevelWidth = segment.width
@@ -569,28 +672,32 @@ export class GameScene extends Scene {
   }
 
   /**
-   * Общая часть перехода на следующий водный сегмент (level -> targetLevel) —
-   * тот же приём смены сегмента, что и у муравья/уровня 1->2 (см. update()):
-   * X-смещение на ширину экрана, чистка сущностей позади, генерация нового
-   * куска. Вызывается и мгновенно (single player/повторный переход, если
-   * канонический сегмент уже известен), и из колбэка prepareWaterSegment()
-   * в co-op (см. вызовы ниже).
+   * Уровень 3 (co-op) — накладывает уже собранные (кем угодно) кувшинки/ключ/
+   * статус прохода на только что сгенерированную (из общего seed) карту —
+   * тот же принцип, что и applyLevelDiff для уровней 0/1/2, только источник —
+   * WaterSegmentState (см. GameNetworkStore.getWaterLevelState), а не
+   * RoomLevelState. Вызывается сразу после generateNextLevel(3, ...) в co-op —
+   * иначе поздний/переподключившийся игрок собирал бы уже найденный
+   * партнёром ключ заново. В single player getWaterLevelState() всегда null —
+   * безопасный no-op.
    */
-  private advanceWaterSegment(targetLevel: number): void {
-    this.levelIndex = targetLevel
-    this.currentLevelXOffset += window.innerWidth
+  private applyWaterLevelCatchUp(): void {
+    const state = this.network.getWaterLevelState()
+    if (!state || state.level !== this.levelIndex) return
 
-    const safeXBound = this.currentLevelXOffset - window.innerWidth * 2
-    this.entities = this.entities.filter((entity) => {
-      if (entity !== this.activePlayer && entity.container.x < safeXBound) {
-        this.worldContainer.removeChild(entity.container)
-        return false
+    if (state.collectedItemIds.length > 0) {
+      const collectibles = this.entities.filter((e): e is LilyPad | Key => e instanceof LilyPad || e instanceof Key)
+      for (const id of state.collectedItemIds) {
+        const item = collectibles.find((e) => e.id === id)
+        if (item) item.container.visible = false
       }
-      return true
-    })
+    }
 
-    this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
-    this.worldContainer.addChild(this.activePlayer.container)
+    this.keyFound = state.keyFound
+    if (state.keyFound) {
+      const passages = this.entities.filter((e): e is SubmergedPassage => e instanceof SubmergedPassage)
+      for (const passage of passages) passage.open()
+    }
   }
 
   /**
@@ -618,7 +725,11 @@ export class GameScene extends Scene {
       }
     }
 
+    // Это догоняющий снапшот при входе/реконнекте, а не живой подбор пузырька
+    // — тут уместен мгновенный скачок без анимации, targetLightRadius сразу
+    // синхронизируем, чтобы updateLightRadius не начал "доезжать" из старого значения.
     this.lightRadius = this.baseLightRadius + levelState.lightRadiusBonus
+    this.targetLightRadius = this.lightRadius
     this.rebuildFogTexture()
 
     this.revealTimer = levelState.lightEndsAt > 0 ? Math.max(0, (levelState.lightEndsAt - Date.now()) / 1000) : 0
@@ -964,8 +1075,9 @@ export class GameScene extends Scene {
         if (update.kind === "light") {
           const bubble = bubbles.find((b) => b.id === update.bubbleId)
           if (bubble) bubble.container.visible = false
-          this.lightRadius = this.baseLightRadius + update.lightRadiusBonus
-          this.rebuildFogTexture()
+          // Сдвигаем только цель — сам lightRadius плавно доедет до неё в
+          // updateLightRadius, без синхронной перестройки текстуры тумана тут же.
+          this.targetLightRadius = this.baseLightRadius + update.lightRadiusBonus
         } else {
           const speedBubble = speedBubbles.find((b) => b.id === update.bubbleId)
           if (speedBubble) speedBubble.container.visible = false
@@ -1084,8 +1196,26 @@ export class GameScene extends Scene {
     // всегда один "экран" (в отличие от увеличенных digLevelWidth/Height), и
     // 0 по умолчанию (single player/пока co-op ещё не согласовал) — тогда
     // подставляем обычный window.innerWidth/Height.
-    const width = level <= 1 ? this.roomLevelWidth : level === 2 ? this.pondLevelWidth || window.innerWidth : this.waterLevelWidth || window.innerWidth
-    const height = level <= 1 ? this.roomLevelHeight : level === 2 ? this.pondLevelHeight || window.innerHeight : this.waterLevelHeight || window.innerHeight
+    // level === 4 — снова копание (жаба вернулась червяком через подводный
+    // проход, см. update()/handleMetamorphosis) — переиспользует те же
+    // roomLevelWidth/Height, что и уровни 0/1: тот же принцип синхронизации
+    // размера для co-op (см. prepareRoomLevel), просто пересчитанные заново
+    // (см. handleMetamorphosis) под актуальный digLevelWidth()/Height().
+    const width =
+      level <= 1 || level === 4
+        ? this.roomLevelWidth
+        : level === 2
+          ? this.pondLevelWidth || window.innerWidth
+          : this.waterLevelWidth || window.innerWidth
+    // level === 3 — единственный водный уровень, заметно выше обычного
+    // экрана (VERTICAL_WATER_HEIGHT_MULTIPLIER) — есть куда всплывать/нырять
+    // (см. комментарий у VERTICAL_WATER_HEIGHT_MULTIPLIER в GameConfig.ts).
+    const height =
+      level <= 1 || level === 4
+        ? this.roomLevelHeight
+        : level === 2
+          ? this.pondLevelHeight || window.innerHeight
+          : this.waterLevelHeight || window.innerHeight * VERTICAL_WATER_HEIGHT_MULTIPLIER
 
     // Дверной проём по центру, общий для потолка уровня 0 и пола уровня 1 —
     // одни и те же X-границы гарантируют, что проход между уровнями всегда
@@ -1318,13 +1448,88 @@ export class GameScene extends Scene {
       this.addEntity(
         new BigBranch(startX + 90, bigBranchTargetX, startY + this.grassLineY - 10, bigBranchWidth, MATERIAL_SIZE * 1.3),
       )
-    } else if (level >= 3) {
-      // Уровень 4 (индекс 3) и дальше — водоём: муравей уже прошёл
-      // метаморфозу в жабу на правом краю уровня 3 (см. update()), и весь
+    } else if (level === 3) {
+      // Уровень 3 — единственный водный уровень: муравей уже прошёл
+      // метаморфозу в жабу на правом краю уровня 2 (см. update()), и весь
       // сегмент теперь целиком залит водой сверху донизу (Water — не только
-      // над травой, как Sky, а во всю высоту) — жаба плавает по всей этой
-      // толще, а не идёт по одной линии, как муравей.
+      // над травой, как Sky, а во всю высоту), причём заметно выше обычного
+      // экрана (см. VERTICAL_WATER_HEIGHT_MULTIPLIER) — жаба спавнится у
+      // самого дна (см. handleMetamorphosis/startCoopFrogLevel) и должна
+      // всплыть к поверхности, а не просто немного проплыть по одной линии.
       this.addEntity(new Water(startX, startY, width, height))
+      // Реальная высота уровня нужна update() (клампы жабы по Y) и следующей
+      // метаморфозе (Frog -> Worm, чтобы поставить уровень 4 НИЖЕ водоёма, а
+      // не поверх него) — на случай, если height подставился запасным
+      // значением (single player), запоминаем именно то, что реально
+      // сгенерировали, а не пересчитываем формулу заново в другом месте.
+      this.waterLevelHeight = height
+
+      // Кувшинки (чисто "флейвор"-коллекционка) + один спрятанный среди них
+      // ключ — только в узкой полосе у самой поверхности (см.
+      // LILY_PAD_SURFACE_BAND_HEIGHT): чтобы найти ключ, обязательно нужно
+      // всплыть, а не просто поплавать у дна, где спавнится жаба.
+      const surfaceTop = startY + 20
+      const surfaceBottom = startY + LILY_PAD_SURFACE_BAND_HEIGHT
+      const keyIndex = Math.floor(this.rng() * LILY_PAD_COUNT)
+      for (let i = 0; i < LILY_PAD_COUNT; i++) {
+        const x = startX + 60 + this.rng() * (width - 120)
+        const y = surfaceTop + this.rng() * (surfaceBottom - surfaceTop)
+        if (i === keyIndex) {
+          this.addEntity(new Key(x, y, `${level}:key`))
+        } else {
+          this.addEntity(new LilyPad(x, y, `${level}:lilypad:${i}`))
+        }
+      }
+
+      // Подводный проход — у самого дна, по центру; заперт, пока ключ не
+      // найден (см. update(), ветка activePlayer instanceof Frog).
+      const passageX = startX + width / 2 - SUBMERGED_PASSAGE_WIDTH / 2
+      const passageY = startY + height - SUBMERGED_PASSAGE_BOTTOM_MARGIN - SUBMERGED_PASSAGE_HEIGHT
+      this.addEntity(
+        new SubmergedPassage(passageX, passageY, SUBMERGED_PASSAGE_WIDTH, SUBMERGED_PASSAGE_HEIGHT, `${level}:passage`),
+      )
+    } else if (level === 4) {
+      // Уровень 4 — жаба вернулась червяком через подводный проход (см.
+      // handleMetamorphosis) — снова копание, тот же принцип грунта (камень/
+      // руда/дирт), что и на уровне 0, только без дверного проёма в потолке:
+      // дальше уровней пока нет (см. план), поэтому потолок сплошной бедрок.
+      // Врагов/сбор предметов сюда намеренно не добавляем — задача этого
+      // уровня только подтвердить, что управление честно переключилось
+      // обратно на форму червяка, без лишних новых механик.
+      for (let x = startX; x < startX + width + this.cellSize; x += this.cellSize) {
+        const isEdgeColumn = x <= startX || x >= startX + width - this.cellSize
+
+        for (let y = startY; y < startY + height; y += this.cellSize) {
+          const localY = y - startY
+          const cellKey = `${level}:${x}:${y}`
+
+          // Потолок/пол/боковые стены — сплошной непрогрызаемый бедрок,
+          // кроме стартовой ямы у самого верха (см. ниже), куда попадает
+          // свежий червяк.
+          if (localY < this.cellSize || localY >= height - this.cellSize || isEdgeColumn) {
+            this.addEntity(new Wall(x, y, this.cellSize, this.cellSize, "bedrock", cellKey))
+            continue
+          }
+
+          // Стартовая яма у самого верха (то же самое, что и STARTING_PIT у
+          // уровня 0, только у потолка, а не у пола — червяк "падает" сюда
+          // сверху, из только что закрытого прохода).
+          if (
+            x > startX + width / 2 - STARTING_PIT_HALF_WIDTH &&
+            x < startX + width / 2 + STARTING_PIT_HALF_WIDTH &&
+            y < startY + STARTING_PIT_DEPTH + this.cellSize
+          ) {
+            continue
+          }
+
+          const heightFactor = localY / height
+          const stoneChance = TERRAIN_STONE_BASE_CHANCE + TERRAIN_STONE_HEIGHT_FACTOR * heightFactor
+          const oreChance = TERRAIN_ORE_CHANCE
+          const roll = this.rng()
+          const type = roll < stoneChance ? "stone" : roll < stoneChance + oreChance ? "ore" : "dirt"
+          this.addEntity(new Wall(x, y, this.cellSize, this.cellSize, type, cellKey))
+        }
+      }
     }
 
     // Кнопка сохранения — только на уровнях 1/2 (там, где ходит муравей по
@@ -1356,15 +1561,18 @@ export class GameScene extends Scene {
       }
 
       addBoundaryColumn(startX)
-    } else if (level >= 3) {
-      // Уровни 4+ (жаба, вода) — сегмент залит целиком, поэтому и граница
+    } else if (level === 3) {
+      // Уровень 3 (жаба, вода) — сегмент залит целиком, поэтому и граница
       // идёт от самого верха до самого низа, а не только до линии травы.
-      // Правый край не закрываем нигде — там всегда переход в следующий
-      // (тоже водный) сегмент.
+      // Правый край не закрываем — по X жаба тоже может двигаться в пределах
+      // сегмента (см. FROG_EDGE_MARGIN), но выхода за него всё равно нет ни в
+      // одну сторону, кроме подводного прохода у дна.
       for (let y = startY; y < startY + height; y += this.cellSize) {
         this.addEntity(new Wall(startX, y, this.cellSize, this.cellSize, "bedrock"))
       }
     }
+    // level === 4 сам полностью запечатывает себя (бедрок по всему периметру)
+    // в своей собственной ветке генерации выше — отдельная граница тут не нужна.
 
     // Звёзды, пузырьки, факел, домик воров и стражи — часть механики копания
     // (уровни 0/1). На горизонтальном уровне-беге (2+) муравей ничего из
@@ -1672,6 +1880,7 @@ export class GameScene extends Scene {
       this.fogSprite = new Sprite(this.buildFogTexture())
       this.fogSprite.anchor.set(0.5)
       this.fogSprite.eventMode = "none"
+      this.fogTextureRadius = this.lightRadius
 
       this.fogContainer.addChild(this.fogSprite)
     } else {
@@ -1703,7 +1912,10 @@ export class GameScene extends Scene {
     return Texture.from(canvas)
   }
 
-  /** Перестраивает текстуру тумана под новый lightRadius (после пузырька света). */
+  /** Перестраивает текстуру тумана под новый lightRadius — дорогая операция
+   * (рисует и грузит в GPU текстуру в несколько раз больше экрана), поэтому
+   * вызывается только на структурные сбросы (старт/рестарт уровня, догоняющий
+   * снапшот при входе), а не на каждый подобранный пузырёк — см. updateLightRadius. */
   private rebuildFogTexture(): void {
     if (!this.fogSprite) return
 
@@ -1715,10 +1927,17 @@ export class GameScene extends Scene {
     // GameScene.destroyed) — сам this.fogSprite при этом остаётся тем же
     // JS-объектом, просто с обнулёнными внутренностями.
     oldTexture?.destroy(true)
+
+    // Новая текстура один в один соответствует текущему lightRadius —
+    // масштаб сбрасываем к 1, а fogTextureRadius запоминаем как точку отсчёта
+    // для дальнейшего масштабирования (см. updateFog).
+    this.fogTextureRadius = this.lightRadius
+    this.fogSprite.scale.set(1)
   }
 
   /**
-   * Двигает "дырку" тумана к текущей экранной позиции игрока и включает
+   * Двигает "дырку" тумана к текущей экранной позиции игрока, растягивает её
+   * под текущий (уже сглаженный updateLightRadius) lightRadius и включает
    * туман только пока копает червяк — на поверхности (муравей) и во время
    * зума метаморфозы туман скрыт.
    */
@@ -1736,6 +1955,29 @@ export class GameScene extends Scene {
     if (isDigging) {
       const screenPos = this.worldContainer.toGlobal(this.activePlayer.container.position)
       this.fogSprite.position.set(screenPos.x, screenPos.y)
+
+      // Радиус "дырки" запечён в текстуру под fogTextureRadius — рост от
+      // пузырька (targetLightRadius, сглаженный в lightRadius) рисуем просто
+      // масштабом спрайта, без перестройки текстуры на каждый кадр анимации.
+      if (this.fogTextureRadius > 0) {
+        this.fogSprite.scale.set(this.lightRadius / this.fogTextureRadius)
+      }
+    }
+  }
+
+  /** Плавно "доводит" lightRadius до targetLightRadius после подбора пузырька
+   * света — экспоненциальное сглаживание, тот же приём, что и у стрелки
+   * партнёра/камеры (см. PARTNER_ARROW_SMOOTHING/WORM_CAMERA_FOLLOW_LERP). Сам
+   * пузырёк только двигает targetLightRadius, здесь это превращается в
+   * плавный рост видимого круга света вместо мгновенного скачка. */
+  private updateLightRadius(deltaTime: number): void {
+    if (this.lightRadius === this.targetLightRadius) return
+
+    const smoothing = Math.min(1, this.lightRadiusSmoothing * deltaTime)
+    this.lightRadius += (this.targetLightRadius - this.lightRadius) * smoothing
+
+    if (Math.abs(this.targetLightRadius - this.lightRadius) < 0.5) {
+      this.lightRadius = this.targetLightRadius
     }
   }
 
@@ -1823,7 +2065,7 @@ export class GameScene extends Scene {
 
             console.log("Метаморфоз завершен! Родился Муравей.")
             this.metaState = MetaState.ZOOM_OUT
-          } else {
+          } else if (this.activePlayer instanceof Ant) {
             // Ant -> Frog: муравей у правого края уровня 2 (лужи/листья)
             // превращается в жабу — и заодно уровень тут же переходит на
             // следующий (водный) сегмент, тем же приёмом, что и обычный
@@ -1861,12 +2103,15 @@ export class GameScene extends Scene {
               })
 
               this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
+              this.applyWaterLevelCatchUp()
 
-              // Жаба рождается по центру высоты водного сегмента — свободного
-              // плавания по вертикали у муравья не было, так что фиксированной
-              // "линии травы" тут взять неоткуда.
-              const frogY = this.currentLevelYOffset + window.innerHeight / 2
-              const frogX = this.currentLevelXOffset + 60
+              // Жаба рождается у самого дна (у подводного прохода) — уровень
+              // 3 заметно выше обычного экрана (см. waterLevelHeight, уже
+              // заполненный generateNextLevel выше), и всплыть к поверхности
+              // (за кувшинками/ключом) предстоит именно ей самой, а не начать
+              // сразу оттуда.
+              const frogY = this.currentLevelYOffset + this.waterLevelHeight - SUBMERGED_PASSAGE_HEIGHT - SUBMERGED_PASSAGE_BOTTOM_MARGIN - 60
+              const frogX = this.currentLevelXOffset + window.innerWidth / 2
               const frog = new Frog(this.input, frogX, frogY)
               this.activePlayer = frog
 
@@ -1874,6 +2119,71 @@ export class GameScene extends Scene {
               this.worldContainer.addChild(frog.container)
 
               console.log("Метаморфоз завершён! Рождена Жаба.")
+              this.metaState = MetaState.ZOOM_OUT
+            })
+          } else if (this.activePlayer instanceof Frog && !this.pendingWormInit) {
+            // Frog -> Worm: жаба у открытого (ключ найден) подводного прохода
+            // в самом низу уровня 3 превращается обратно в червя — уровень 4
+            // (снова копание) генерируется тут же: в co-op — из
+            // pendingLevel4State, уже присланного сервером вместе с
+            // waterPassageEntered (см. триггер этого перехода в update()),
+            // чтобы оба игрока получили один и тот же seed/размер; в single
+            // player — просто локально, тем же способом, что и старт уровня 0.
+            //
+            // pendingWormInit держит TRANSFORM тут же (без повторного захода в
+            // эту ветку каждый кадр) до тех пор, пока не загрузится спрайт
+            // нового червяка (Worm.init() асинхронный, в отличие от Ant/Frog) —
+            // тот же принцип, что и pendingWaterSegment выше.
+            this.pendingWormInit = true
+
+            const level4State = this.pendingLevel4State
+            this.pendingLevel4State = null
+
+            if (level4State) {
+              this.prepareRoomLevel(level4State, this.network.getEpoch())
+            } else {
+              this.rng = Math.random
+              this.roomLevelWidth = this.digLevelWidth()
+              this.roomLevelHeight = this.digLevelHeight()
+              this.levelIndex = 4
+            }
+
+            // Новый, заведомо свободный от всего остального (диг-фазы,
+            // поверхности, самого водоёма) блок координат — ниже уровня 3 по
+            // Y (тот уже целиком известен, см. waterLevelHeight), дальше по X.
+            const nextYOffset = this.currentLevelYOffset + this.waterLevelHeight + this.digLevelHeight()
+            const nextXOffset = this.currentLevelXOffset + window.innerWidth
+
+            const worm = new Worm(this.input)
+            worm.init().then(() => {
+              this.pendingWormInit = false
+              if (this.destroyed) return
+
+              this.worldContainer.removeChild(this.activePlayer.container)
+              this.entities = this.entities.filter((e) => e !== this.activePlayer)
+
+              this.currentLevelYOffset = nextYOffset
+              this.currentLevelXOffset = nextXOffset
+
+              const safeXBound = this.currentLevelXOffset - window.innerWidth * 2
+              this.entities = this.entities.filter((entity) => {
+                if (entity.container.x < safeXBound) {
+                  this.worldContainer.removeChild(entity.container)
+                  return false
+                }
+                return true
+              })
+
+              this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
+
+              worm.container.x = this.currentLevelXOffset + this.roomLevelWidth / 2
+              worm.container.y = this.currentLevelYOffset + 60
+              this.activePlayer = worm
+
+              this.addEntity(worm)
+              this.worldContainer.addChild(worm.container)
+
+              console.log("Метаморфоз завершён! Жаба снова стала червяком.")
               this.metaState = MetaState.ZOOM_OUT
             })
           }
@@ -1884,10 +2194,15 @@ export class GameScene extends Scene {
         // Название состояния осталось от старой версии (когда камера
         // действительно зумилась обратно до 1x) — теперь же она, наоборот,
         // доводится ДО целевого зума новой формы (antFocusZoomScale у
-        // муравья, frogFocusZoomScale у жабы — оба больше пикового зума
-        // самого превращения) и остаётся там: игрок всегда в фокусе камеры,
-        // она не возвращается к обычному виду всего экрана.
-        const targetZoomScale = this.activePlayer instanceof Frog ? this.frogFocusZoomScale : this.antFocusZoomScale
+        // муравья, frogFocusZoomScale у жабы, wormFocusZoomScale у
+        // вернувшегося червяка — все больше пикового зума самого
+        // превращения) и остаётся там: игрок всегда в фокусе камеры, она не
+        // возвращается к обычному виду всего экрана.
+        const targetZoomScale = this.activePlayer instanceof Frog
+          ? this.frogFocusZoomScale
+          : this.activePlayer instanceof Worm
+            ? this.wormFocusZoomScale
+            : this.antFocusZoomScale
 
         if (this.worldContainer.scale.x < targetZoomScale) {
           const zoomSpeed = deltaTime * META_ZOOM_SPEED
@@ -2176,6 +2491,7 @@ export class GameScene extends Scene {
     this.syncNetwork(deltaTime)
     this.updateReveal(deltaTime)
     this.updateSpeedBoost(deltaTime)
+    this.updateLightRadius(deltaTime)
     this.updateFog()
 
     // Общий мир копания (уровни 0/1) — широковещательные "весь мир меняется
@@ -2369,34 +2685,82 @@ export class GameScene extends Scene {
         }
       }
 
-      // Следующий водный сегмент (уровень 5+): жаба доплывает до правого
-      // края текущего сегмента — тот же приём смены сегмента, что и у
-      // муравья на уровне 1->2 (без метаморфозы, форма уже не меняется). В
-      // co-op прогресс на воде независим у каждого игрока (нет общей
-      // "двери") — переход не ждёт партнёра, только свой собственный
-      // round-trip до сервера за каноническим seed/размером следующего
-      // сегмента (см. prepareWaterSegment/pendingWaterSegment).
-      if (this.activePlayer instanceof Frog && this.levelIndex >= 3) {
-        const localPlayerX = this.activePlayer.container.x - this.currentLevelXOffset
+      // Уровень 3 (единственный водный уровень) — кувшинки/ключ/подводный
+      // проход (см. GameScene.generateNextLevel, level === 3). В co-op ключ и
+      // кувшинки — общие для комнаты (тот же принцип "первый забрал —
+      // навсегда для всех", что и у пузырьков/факела, см.
+      // WaterSegmentState.collectedItemIds): не гасим их локально сами, ждём
+      // подтверждения от сервера (waterItemCollected), иначе одновременный
+      // подбор двумя игроками задвоил бы эффект/сбил анти-даблпик.
+      if (this.activePlayer instanceof Frog && this.levelIndex === 3) {
+        const isCoop = this.network.getSnapshot().mode === "coop"
 
-        if (localPlayerX >= window.innerWidth - 40) {
-          if (this.network.getSnapshot().mode === "coop") {
-            // Держим жабу у края, пока не придёт канонический сегмент.
-            this.activePlayer.container.x = this.currentLevelXOffset + window.innerWidth - 40
-            if (!this.pendingWaterSegment) {
-              this.pendingWaterSegment = true
-              const targetLevel = this.levelIndex + 1
-              this.prepareWaterSegment(targetLevel).then(() => {
-                this.pendingWaterSegment = false
-                if (this.destroyed) return
-                this.advanceWaterSegment(targetLevel)
-              })
-            }
-            return
+        if (isCoop) {
+          for (const update of this.network.drainWaterItemCollected()) {
+            if (update.level !== this.levelIndex) continue
+            const item = this.entities.find(
+              (e): e is LilyPad | Key => (e instanceof LilyPad || e instanceof Key) && e.id === update.itemId,
+            )
+            if (item) item.container.visible = false
+            if (update.keyFound) this.keyFound = true
           }
 
-          this.advanceWaterSegment(this.levelIndex + 1)
-          return
+          const advanced = this.network.drainWaterPassageEntered()
+          if (advanced) {
+            this.pendingLevel4State = advanced.levelState
+            this.metaState = MetaState.ZOOM_IN
+            this.metaTimer = 0
+            return
+          }
+        } else {
+          const lilyPads = this.entities.filter((e): e is LilyPad => e instanceof LilyPad)
+          for (const pad of lilyPads) {
+            if (pad.container.visible && this.activePlayer.isColliding(pad)) {
+              pad.container.visible = false
+            }
+          }
+
+          const keys = this.entities.filter((e): e is Key => e instanceof Key)
+          for (const key of keys) {
+            if (key.container.visible && this.activePlayer.isColliding(key)) {
+              key.container.visible = false
+              this.keyFound = true
+            }
+          }
+        }
+
+        if (isCoop) {
+          const lilyPads = this.entities.filter((e): e is LilyPad => e instanceof LilyPad)
+          for (const pad of lilyPads) {
+            if (pad.container.visible && this.activePlayer.isColliding(pad)) {
+              this.network.requestWaterItemPickup(this.levelIndex, pad.id, false)
+            }
+          }
+
+          const keys = this.entities.filter((e): e is Key => e instanceof Key)
+          for (const key of keys) {
+            if (key.container.visible && this.activePlayer.isColliding(key)) {
+              this.network.requestWaterItemPickup(this.levelIndex, key.id, true)
+            }
+          }
+        }
+
+        const passages = this.entities.filter((e): e is SubmergedPassage => e instanceof SubmergedPassage)
+        for (const passage of passages) {
+          if (this.keyFound) passage.open()
+
+          if (this.keyFound && passage.isUnlocked && this.activePlayer.isColliding(passage)) {
+            if (isCoop) {
+              if (!this.pendingWaterPassageEnter) {
+                this.pendingWaterPassageEnter = true
+                this.network.requestWaterPassageEnter(this.levelIndex, this.digLevelWidth(), this.digLevelHeight())
+              }
+            } else {
+              this.metaState = MetaState.ZOOM_IN
+              this.metaTimer = 0
+              return
+            }
+          }
         }
       }
 
@@ -2577,11 +2941,15 @@ export class GameScene extends Scene {
 
       if (this.activePlayer instanceof Frog) {
         // Жаба плавает свободно в толще воды — в отличие от муравья, границы
-        // сегмента считаем по ОБЕИМ осям (X и Y), не только по X.
+        // сегмента считаем по ОБЕИМ осям (X и Y), не только по X. По Y — не
+        // window.innerHeight (уровень 3 заметно выше обычного экрана), а
+        // реальная высота уровня (см. waterLevelHeight, заполняется
+        // generateNextLevel) с тем же запасным множителем, что и там.
+        const levelHeight = this.waterLevelHeight || window.innerHeight * VERTICAL_WATER_HEIGHT_MULTIPLIER
         const minX = this.currentLevelXOffset + FROG_EDGE_MARGIN
         const maxX = this.currentLevelXOffset + window.innerWidth - FROG_EDGE_MARGIN
         const minY = this.currentLevelYOffset + FROG_EDGE_MARGIN
-        const maxY = this.currentLevelYOffset + window.innerHeight - FROG_EDGE_MARGIN
+        const maxY = this.currentLevelYOffset + levelHeight - FROG_EDGE_MARGIN
         this.activePlayer.container.x = Math.min(Math.max(this.activePlayer.container.x, minX), maxX)
         this.activePlayer.container.y = Math.min(Math.max(this.activePlayer.container.y, minY), maxY)
 
@@ -2620,8 +2988,9 @@ export class GameScene extends Scene {
             this.network.requestBoostActivate(this.levelIndex, bubble.id, "light")
           } else {
             bubble.container.visible = false
-            this.lightRadius += this.lightRadiusPerBubble
-            this.rebuildFogTexture()
+            // Как и в co-op-ветке выше — двигаем только цель, растёт плавно
+            // в updateLightRadius, без хитча от синхронной перестройки тумана.
+            this.targetLightRadius += this.lightRadiusPerBubble
             console.log("Пузырёк света собран! Радиус видимости увеличен.")
           }
         }
