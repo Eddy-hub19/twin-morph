@@ -2,13 +2,20 @@ import { AnimatedSprite, Assets, type Spritesheet, type Texture } from "pixi.js"
 import { Entity } from "./Entity"
 import { InputManager } from "../input/InputManager"
 import { findWallAt, type Wall, type WallLookup } from "./Wall"
-import { Star } from "./Star"
 import { PlayerCosmetics, type PartnerRole } from "./PlayerCosmetics"
-import { WORM_SPEED, WORM_DIG_HIT_INTERVAL } from "../config/GameConfig"
+import { WORM_SPEED, WORM_DIG_HIT_INTERVAL, REMOTE_PLAYER_SMOOTHING } from "../config/GameConfig"
 
 type AnimationState = "idle" | "walk" | "dead"
 
 export class Worm extends Entity {
+  // Спрайт центрирован (sprite.anchor.set(0.5) — см. init()), поэтому
+  // container.x/y — это его центр, а не левый верхний угол; getBounds()
+  // должен знать об этом же самом центрировании (см. Entity.originX/Y),
+  // иначе рамка столкновений съезжала бы вправо-вниз от того, что реально
+  // видно на экране.
+  protected override originX = 0.5
+  protected override originY = 0.5
+
   private speed = WORM_SPEED
   /** Пузырёк скорости (co-op — общий на комнату) временно множит скорость —
    * см. GameScene.updateSpeedBoost. 1 = обычная скорость. */
@@ -69,7 +76,12 @@ export class Worm extends Entity {
     this.container.addChild(this.sprite)
   }
 
-  public update(deltaTime: number, wallLookup: WallLookup, stars: Star[] = []): void {
+  /**
+   * Подбор звезды сюда больше не входит — GameScene сам делает это через
+   * единый tryPickupStar() (см. GameScene.update()), а не по diff'у
+   * видимости, который раньше приходилось пересоздавать здесь неявно.
+   */
+  public update(deltaTime: number, wallLookup: WallLookup): void {
     if (this.animationState === "dead") {
       return
     }
@@ -180,13 +192,6 @@ export class Worm extends Entity {
       this.container.x = nextX
       this.container.y = nextY
     }
-
-    for (const star of stars) {
-      if (star.container.visible && this.isColliding(star)) {
-        star.container.visible = false
-        console.log("Звезда собрана!")
-      }
-    }
   }
 
   private getFrames(sheet: Spritesheet | undefined, animationName: AnimationState): Texture[] {
@@ -203,9 +208,14 @@ export class Worm extends Entity {
    * (свои собственные, отдельно сгенерированные стены), нам остаётся только
    * отрисовать результат: позицию + анимацию ходьбы по факту смещения между
    * кадрами (в отличие от обычного update(), тут нет ни клавиатуры, ни
-   * джойстика — только "куда сместился с прошлого раза").
+   * джойстика — только "куда сместился с прошлого раза"). x/y — уже
+   * интерполированная (и ограниченно экстраполированная — см.
+   * GameNetworkStore.getRemotePlayerStates) цель, а не сырой снапшот; сюда же
+   * доводимся ПЛАВНО (REMOTE_PLAYER_SMOOTHING), а не телепортом — иначе
+   * редкая, но заметная коррекция после лаг-спайка выглядела бы как
+   * мгновенный прыжок, а не как естественное "нагнать".
    */
-  public setRemotePosition(x: number, y: number): void {
+  public setRemotePosition(x: number, y: number, deltaTime: number): void {
     if (!this.sprite || this.animationState === "dead") return
 
     const dx = x - this.container.x
@@ -222,8 +232,9 @@ export class Worm extends Entity {
       this.applyAnimation(nextState)
     }
 
-    this.container.x = x
-    this.container.y = y
+    const smoothing = Math.min(1, REMOTE_PLAYER_SMOOTHING * deltaTime)
+    this.container.x += dx * smoothing
+    this.container.y += dy * smoothing
   }
 
   /** Убивает червя извне (например, столкновение со стражем) — тот же путь, что и смерть от камня. */

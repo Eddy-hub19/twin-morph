@@ -1,7 +1,5 @@
 import { Assets, AnimatedSprite, Container, Graphics, Sprite, Texture } from "pixi.js"
 import { Entity } from "./Entity"
-import { Wall } from "./Wall"
-import { Star } from "./Star"
 import { PlayerCosmetics, type PartnerRole } from "./PlayerCosmetics"
 import type { MaterialKind } from "./Material"
 import {
@@ -15,6 +13,7 @@ import {
   ANT_ANALOG_DEADZONE,
   DROWN_FLAIL_DURATION,
   MATERIAL_SIZE,
+  REMOTE_PLAYER_SMOOTHING,
 } from "../config/GameConfig"
 
 const DESIRED_HEIGHT = ANT_DESIRED_HEIGHT
@@ -57,6 +56,14 @@ const JAWS_FX = 78 / 100
 const JAWS_FY = (20 + 10) / 62
 
 export class Ant extends Entity {
+  // Тот же якорь, что и у sprite.anchor.set(0.5, 0.85) ниже (см. init()) —
+  // муравей стоит на земле ножками, container.y — не центр тела, а точка
+  // чуть выше них. См. комментарий у Entity.originX/Y и Worm.originX/Y —
+  // без этого рамка столкновений считала бы container.y верхним краем
+  // спрайта и съезжала бы вниз от того, что реально видно.
+  protected override originX = 0.5
+  protected override originY = 0.85
+
   public isDead = false
   /** true, если последняя смерть — утопление в пруду (уровень 3, индекс 2):
    * GameScene по этому флагу решает респавнить муравья на чекпоинте, а не
@@ -276,6 +283,15 @@ export class Ant extends Entity {
     this.jawsSprite.position.set(tip.x, tip.y)
   }
 
+  /** Вызывается ИЗ GameScene.tryPickupStar() сразу по факту успешного подбора
+   * звезды муравьём — на LEAF_DURATION секунд показывает листочек на усике
+   * (сама звезда прячется/засчитывается в tryPickupStar, этот метод —
+   * только визуальный отклик, тот же, что раньше срабатывал изнутри
+   * update() при прямом столкновении со звездой). */
+  public showLeafPickupEffect(): void {
+    this.leafTimer = LEAF_DURATION
+  }
+
   /** Обновляет позицию/прозрачность листочка, подобранного на усик, и гасит его по истечении таймера. */
   private updateLeaf(deltaTime: number): void {
     if (!this.leafSprite || this.leafTimer <= 0) return
@@ -300,7 +316,10 @@ export class Ant extends Entity {
     }
   }
 
-  public update(deltaTime: number, walls: Wall[], stars: Star[]): void {
+  /** Подбор звезды сюда больше не входит — единая точка теперь
+   * GameScene.tryPickupStar(), которая сама зовёт showLeafPickupEffect()
+   * ниже, когда подбор случился именно муравьём (см. GameScene.update()). */
+  public update(deltaTime: number): void {
     // Защита: пока спрайт не загрузился, ничего не делаем
     if (!this.sprite) return
 
@@ -364,16 +383,6 @@ export class Ant extends Entity {
       this.sprite.gotoAndStop(0)
     }
 
-    // Подобрал звезду — вместо неё на секунду показываем листочек на усике
-    // (звезда всё так же считается собранной: GameScene сам заметит, что она
-    // погасла, и обновит счётчик).
-    for (const star of stars) {
-      if (star.container.visible && this.isColliding(star)) {
-        star.container.visible = false
-        this.leafTimer = LEAF_DURATION
-      }
-    }
-
     this.updateLeaf(deltaTime)
     this.updateCarriedMaterial()
   }
@@ -383,8 +392,10 @@ export class Ant extends Entity {
    * аналог Worm.setRemotePosition: своя физика (столкновения с лужами,
    * сбор листьев) уже честно посчитана на ЕГО клиенте, нам остаётся только
    * отрисовать результат — позицию по X и цикл ходьбы по факту смещения.
+   * Доводимся до x плавно (REMOTE_PLAYER_SMOOTHING), а не телепортом — см.
+   * тот же комментарий у Worm.setRemotePosition.
    */
-  public setRemotePosition(x: number): void {
+  public setRemotePosition(x: number, deltaTime: number): void {
     if (!this.sprite || this.isDead || this.isDrowning) return
 
     const dx = x - this.container.x
@@ -397,6 +408,7 @@ export class Ant extends Entity {
       this.sprite.gotoAndStop(0)
     }
 
-    this.container.x = x
+    const smoothing = Math.min(1, REMOTE_PLAYER_SMOOTHING * deltaTime)
+    this.container.x += dx * smoothing
   }
 }

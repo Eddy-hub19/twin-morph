@@ -346,6 +346,12 @@ export class GameScene extends Scene {
   // applyEnemyNetStates) — сам гость эту логику не считает.
   private readonly lastCarriedStarByEnemy = new Map<string, string | null>()
 
+  /** starId, для которых наш собственный запрос на подбор уже в полёте (см.
+   * tryPickupStar) — не даёт слать повторный starPickup КАЖДЫЙ кадр, пока
+   * игрок продолжает касаться звезды, а ответ ещё не пришёл. Всегда пуст в
+   * solo (там подбор мгновенный, локальный, без сети). */
+  private readonly pendingStarPickups = new Set<string>()
+
   // Загружаем сохранённый уровень только один раз — при самом первом
   // onCreate() (настоящая загрузка страницы). Рестарт после смерти вызывает
   // onCreate() повторно на том же экземпляре сцены и должен по-прежнему
@@ -375,6 +381,11 @@ export class GameScene extends Scene {
     this.pendingRoomRestart = false
     this.pendingWaterSegment = false
     this.lastCarriedStarByEnemy.clear()
+    // Рестарт/reconnect — все запросы, отправленные ДО этого момента,
+    // относятся к уже неактуальному уровню/эпохе; их ack (если ещё придёт)
+    // будет отброшен в tryPickupStar по несовпадению levelIndex/roomEpoch,
+    // но сам факт "в полёте" тут ничего больше не должен блокировать.
+    this.pendingStarPickups.clear()
     // Текст факела-выключателя переживал рестарт уровня: revealTimer тут
     // выше уже честно обнулён, но сам HUD-текст (тот же Text-объект, что и
     // до смерти) оставался видимым с застрявшим числом — updateReveal()
@@ -740,6 +751,108 @@ export class GameScene extends Scene {
         if (finalSlot && !finalSlot.isInstalled) finalSlot.install("bigBranch", "bigBranch")
       }
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Уровни 0/1 (копание) — подбор звезды. Раньше эту логику вели Worm/Ant
+  // прямо у себя в update() (сразу прятали звезду при столкновении), а
+  // GameScene лишь ЗАМЕЧАЛ факт по diff'у видимости (starsVisibleBefore,
+  // пересоздаваемому Map'ом каждый кадр) — единственная точка подбора теперь
+  // тут, вызывается из update() при столкновении активного игрока со звездой.
+  // -------------------------------------------------------------------------
+
+  /**
+   * true, если пройденный за этот кадр отрезок (prevX, prevY) -> текущая
+   * позиция активного игрока прошёл достаточно близко к звезде, чтобы
+   * засчитать касание — не только "звезда содержит конечную точку", как у
+   * обычного isColliding(). Без этого при просадке кадра (см. комментарий у
+   * вызова) игрок мог целиком перепрыгнуть маленький хитбокс звезды за один
+   * шаг update(), ни разу не пересекшись с ней в итоговой позиции.
+   * "Радиус" игрока тут — грубая оценка (половина меньшей стороны его
+   * рамки), а не точный AABB, но для маленькой круглой звезды этого более
+   * чем достаточно и намного дешевле честного отрезок-против-прямоугольника.
+   */
+  private isPlayerPathNearStar(prevX: number, prevY: number, star: Star): boolean {
+    const player = this.activePlayer
+    const curX = player.container.x
+    const curY = player.container.y
+
+    const dx = curX - prevX
+    const dy = curY - prevY
+    const lengthSq = dx * dx + dy * dy
+
+    // t — проекция звезды на отрезок движения, зажатая в [0, 1] (0 — старт
+    // кадра, 1 — конец); при lengthSq === 0 игрок не двигался вовсе, и
+    // ближайшая точка отрезка — просто его единственная точка.
+    const t = lengthSq > 0 ? Math.max(0, Math.min(1, ((star.container.x - prevX) * dx + (star.container.y - prevY) * dy) / lengthSq)) : 0
+
+    const closestX = prevX + t * dx
+    const closestY = prevY + t * dy
+
+    const playerRadius = Math.min(player.width, player.height) / 2
+    const hitRadius = star.width / 2 + playerRadius
+
+    return Math.hypot(star.container.x - closestX, star.container.y - closestY) <= hitRadius
+  }
+
+  /**
+   * В single player сразу и без сети засчитывает звезду. В co-op прячет её
+   * ОПТИМИСТИЧНО (не дожидаясь ответа) и просит сервер подтвердить — если
+   * он говорит "уже забрали" (alreadyCollected), оставляем скрытой и просто
+   * подтягиваем актуальный общий счёт; если ack не пришёл вовсе (таймаут)
+   * или сообщает про устаревший level/эпоху — откатываем звезду обратно
+   * видимой, раз сервер её подбор не подтвердил. pendingStarPickups не даёт
+   * слать повторный запрос на КАЖДОМ кадре, пока ответ ещё не пришёл, а
+   * игрок продолжает стоять на звезде.
+   */
+  private tryPickupStar(star: Star): void {
+    if (!star.container.visible || this.pendingStarPickups.has(star.id)) return
+
+    if (this.network.getSnapshot().mode !== "coop") {
+      star.container.visible = false
+      this.collectedStars += 1
+      if (this.activePlayer instanceof Ant) this.activePlayer.showLeafPickupEffect()
+      this.updateHud()
+      return
+    }
+
+    const level = this.levelIndex
+    const epoch = this.roomEpoch
+
+    this.pendingStarPickups.add(star.id)
+    star.container.visible = false
+    if (this.activePlayer instanceof Ant) this.activePlayer.showLeafPickupEffect()
+
+    this.network.requestStarPickup(level, star.id).then((ack) => {
+      this.pendingStarPickups.delete(star.id)
+
+      if (ack.ok) {
+        // Общий счёт/HUD обновит широковещательный starCollected (см.
+        // processSharedLevelEvents/drainStarCollected) — он приходит и
+        // самому отправителю, не только напарнику, так что тут больше
+        // ничего делать не нужно.
+        return
+      }
+
+      if (ack.alreadyCollected) {
+        // Напарник забрал её первым — звезда и так уже скрыта (мы сами
+        // спрятали её оптимистично выше), просто подстраховываем общий
+        // счёт на случай, если широковещательный starCollected от напарника
+        // почему-то ещё не дошёл.
+        if (typeof ack.teamStars === "number") this.network.reconcileTeamStars(ack.teamStars)
+        return
+      }
+
+      // Таймаут или устаревший level/epoch (например, комната успела
+      // перезапуститься/перейти дальше, пока ответ шёл) — откатываем
+      // локальный оптимистичный подбор, раз сервер его не подтвердил. Только
+      // если мы всё ещё на том же уровне/эпохе — иначе эта Star могла уже
+      // быть удалена из мира вовсе (см. clearEntityIndices), возвращать её
+      // видимой незачем и может быть небезопасно.
+      if (this.levelIndex === level && this.roomEpoch === epoch) {
+        star.container.visible = true
+      }
+    })
   }
 
   // -------------------------------------------------------------------------
@@ -2241,7 +2354,7 @@ export class GameScene extends Scene {
 
     for (const state of remoteStates) {
       seenPlayerIds.add(state.playerId)
-      this.upsertRemoteEntity(state)
+      this.upsertRemoteEntity(state, deltaTime)
     }
 
     for (const [playerId, remote] of this.remoteEntities) {
@@ -2309,7 +2422,7 @@ export class GameScene extends Scene {
 
   /** Создаёт (при первом появлении), пересоздаёт (при смене формы — прошёл
    * метаморфозу у себя) и двигает сущность одного напарника. */
-  private upsertRemoteEntity(state: PlayerState): void {
+  private upsertRemoteEntity(state: PlayerState, deltaTime: number): void {
     let remote = this.remoteEntities.get(state.playerId)
 
     if (!remote) {
@@ -2344,10 +2457,10 @@ export class GameScene extends Scene {
     if (remote.entity instanceof Ant) {
       // Муравей ходит только по одной линии травы — Y не шарится (см.
       // Ant.setRemotePosition).
-      remote.entity.setRemotePosition(state.x)
+      remote.entity.setRemotePosition(state.x, deltaTime)
     } else {
       // Worm/Frog двигаются по обеим осям.
-      remote.entity.setRemotePosition(state.x, state.y)
+      remote.entity.setRemotePosition(state.x, state.y, deltaTime)
     }
   }
 
@@ -2695,10 +2808,6 @@ export class GameScene extends Scene {
     }
 
     if (!this.paused && this.activePlayer && this.dynamicEntities.includes(this.activePlayer)) {
-      // По id, а не просто по счётчику — в co-op нужно знать, КАКИЕ именно
-      // звёзды пропали, чтобы запросить их зачёт у сервера (см. ниже).
-      const starsVisibleBefore = new Map(stars.map((star) => [star.id, star.container.visible]))
-
       this.activePlayer.update(deltaTime, this.wallLookup, stars)
 
       if (this.activePlayer instanceof Ant) {
@@ -2849,20 +2958,19 @@ export class GameScene extends Scene {
         this.worldContainer.position.set(window.innerWidth / 2, window.innerHeight / 2)
       }
 
-      const newlyHiddenStars = stars.filter((star) => starsVisibleBefore.get(star.id) && !star.container.visible)
-
-      if (newlyHiddenStars.length > 0) {
-        if (isCoopShared) {
-          // Не считаем локально — общий счёт придёт широковещательно от
-          // сервера (см. processSharedLevelEvents/starCollected), тем самым
-          // и не даём двум игрокам одновременно подобрать одну звезду
-          // (сервер проверяет уникальность starId, см. LevelStateService).
-          for (const star of newlyHiddenStars) {
-            this.network.requestStarPickup(this.levelIndex, star.id)
-          }
-        } else {
-          this.collectedStars += newlyHiddenStars.length
-          this.updateHud()
+      // Звёзды — единая точка подбора tryPickupStar() (см. выше), сама
+      // решает solo/co-op и не даёт слать повторный запрос, пока предыдущий
+      // ещё не подтверждён (см. pendingStarPickups). В отличие от пузырьков/
+      // факела ниже (обычное AABB-пересечение по ТЕКУЩЕЙ позиции) тут
+      // проверяем весь пройденный за кадр отрезок (prevPlayerX/Y -> текущая
+      // позиция), а не только конечную точку — звезда маленькая (STAR_SIZE),
+      // и при просадке кадра (лаг-спайк/большой deltaTime, тот же
+      // прыгающий боост скорости) игрок вполне может целиком перепрыгнуть
+      // её хитбокс за один шаг, ни разу не пересекшись с ним в конечной
+      // позиции — тогда её никак не подобрать.
+      for (const star of stars) {
+        if (star.container.visible && this.isPlayerPathNearStar(prevPlayerX, prevPlayerY, star)) {
+          this.tryPickupStar(star)
         }
       }
 
