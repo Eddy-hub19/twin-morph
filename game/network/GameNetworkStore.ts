@@ -22,9 +22,41 @@ import {
   type RoomRestartPayload,
   type SlotUpdatedPayload,
   type StarCollectedPayload,
+  type StarPickupAck,
   type WallUpdatedPayload,
   type WaterSegmentState,
 } from "@/shared/game-protocol"
+
+/** Ниже этого сдвига (px) поза считается "не изменившейся" — см.
+ * reportLocalPose: не шлём playerPose, если игрок фактически стоит на
+ * месте, даже если throttle-интервал уже прошёл. */
+const POSE_SEND_EPSILON = 0.5
+
+/**
+ * Экстраполяция ограничена этим окном (мс) ЗА пределами последнего снапшота
+ * — см. interpolationFactor ниже. При обрыве связи (лаг-спайк/потерянные
+ * пакеты) призрак партнёра/врага ещё немного "доезжает" по инерции последней
+ * известной скорости вместо мгновенной заморозки на месте, но не бесконечно
+ * (иначе долгий обрыв гнал бы его с той же скоростью в стену/за экран). Как
+ * только реальный снапшот приходит снова, требуемая коррекция позиции
+ * заметно меньше, чем если бы призрак всё это время простоял неподвижно, —
+ * меньше шанс на заметный "прыжок" при восстановлении связи (см.
+ * getRemotePlayerStates/getInterpolatedEnemyStates).
+ */
+const REMOTE_EXTRAPOLATION_CAP_MS = 250
+
+/** t для лерпа между prev/next снапшотом по реальному времени рендера —
+ * обычно в [0, 1] (честная интерполяция между двумя известными точками), но
+ * может уйти чуть выше 1 (та же скорость prev->next, ограниченная
+ * REMOTE_EXTRAPOLATION_CAP_MS), если renderTime уже обогнал самый свежий
+ * снапшот, а новый ещё не пришёл. */
+function interpolationFactor(prevAt: number, nextAt: number, renderTime: number): number {
+  const span = nextAt - prevAt
+  if (span <= 0) return 1
+
+  const maxT = 1 + REMOTE_EXTRAPOLATION_CAP_MS / span
+  return Math.max(0, Math.min(maxT, (renderTime - prevAt) / span))
+}
 
 export type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected"
 
@@ -111,6 +143,12 @@ export class GameNetworkStore {
   private lastInputSentAt = 0
   private readonly minInputIntervalMs = 1000 / SERVER_TICK_RATE
   private lastPoseSentAt = 0
+  /** Последняя реально ОТПРАВЛЕННАЯ поза (см. reportLocalPose) — не то же
+   * самое, что localState.x/y, которые обновляются каждый кадр независимо
+   * от throttle/дедупликации отправки. */
+  private lastSentPoseX = 0
+  private lastSentPoseY = 0
+  private lastSentPoseForm: PlayerForm | null = null
 
   // Общий мир копания (уровни 0/1) — см. shared/game-protocol.ts:
   // RoomLevelState. epoch/teamStars/levelState приходят сначала в JoinRoomAck
@@ -165,8 +203,34 @@ export class GameNetworkStore {
     return this.cachedSnapshot
   }
 
+  /**
+   * update()/reportLocalPose() (позиция локального игрока) и handleSnapshot()
+   * (позиции всех игроков от сервера) зовут notify() КАЖДЫЙ КАДР — 60 раз в
+   * секунду — хотя NetworkSnapshot вообще не содержит позиций (см.
+   * computeSnapshot: только mode/connectionStatus/roomInfo/localPlayerId).
+   * Раньше notify() безусловно пересоздавал this.cachedSnapshot новым
+   * объектом и звал слушателей — useSyncExternalStore сравнивает снапшот по
+   * ссылке (Object.is), так что любой React-компонент, подписанный через
+   * useGameSocket() (см. hooks/useGameSocket.ts), ре-рендерился каждый кадр,
+   * даже если ни одно из этих четырёх полей на самом деле не изменилось.
+   * Теперь снапшот пересоздаётся (и слушатели зовутся) только когда что-то
+   * из них реально другое — Pixi-игровой цикл (GameScene) по-прежнему читает
+   * позиции напрямую из this.localState/remoteBuffers, минуя React вообще.
+   */
   private notify(): void {
-    this.cachedSnapshot = this.computeSnapshot()
+    const next = this.computeSnapshot()
+    const prev = this.cachedSnapshot
+
+    if (
+      prev.mode === next.mode &&
+      prev.connectionStatus === next.connectionStatus &&
+      prev.roomInfo === next.roomInfo &&
+      prev.localPlayerId === next.localPlayerId
+    ) {
+      return
+    }
+
+    this.cachedSnapshot = next
     for (const listener of this.listeners) listener()
   }
 
@@ -394,13 +458,31 @@ export class GameNetworkStore {
   public reportLocalPose(x: number, y: number, form: PlayerForm): void {
     if (!this.localState) return
 
-    this.localState = { ...this.localState, x, y, form }
+    // Мутируем на месте, а не пересоздаём объект через spread — это
+    // вызывается КАЖДЫЙ кадр (из GameScene.syncNetwork), а this.localState
+    // и так не используется как immutable-снапшот нигде (единственный
+    // читатель — getLocalPlayerState(), которым сейчас никто не пользуется:
+    // рендер локального игрока идёт напрямую из Worm/Ant/Frog.update(), а не
+    // отсюда) — просто лишняя аллокация на кадр без всякой выгоды.
+    this.localState.x = x
+    this.localState.y = y
+    this.localState.form = form
     if (this.mode !== "coop") return
 
     const now = typeof performance !== "undefined" ? performance.now() : Date.now()
     if (now - this.lastPoseSentAt < this.minInputIntervalMs) return
 
+    // Не шлём, если поза не изменилась с прошлой отправки (игрок стоит на
+    // месте) — иначе это фиксированные 15-20 пакетов в секунду ВСЕГДА, даже
+    // когда слать нечего.
+    const unchanged =
+      form === this.lastSentPoseForm && Math.abs(x - this.lastSentPoseX) < POSE_SEND_EPSILON && Math.abs(y - this.lastSentPoseY) < POSE_SEND_EPSILON
+    if (unchanged) return
+
     this.lastPoseSentAt = now
+    this.lastSentPoseX = x
+    this.lastSentPoseY = y
+    this.lastSentPoseForm = form
     this.socket?.emit("playerPose", { x, y, form })
   }
 
@@ -459,8 +541,7 @@ export class GameNetworkStore {
 
     const result: PlayerState[] = []
     for (const buffer of this.remoteBuffers.values()) {
-      const span = buffer.nextAt - buffer.prevAt
-      const t = span > 0 ? Math.min(1, Math.max(0, (renderTime - buffer.prevAt) / span)) : 1
+      const t = interpolationFactor(buffer.prevAt, buffer.nextAt, renderTime)
 
       result.push({
         ...buffer.next,
@@ -598,10 +679,49 @@ export class GameNetworkStore {
 
   /** Локальный игрок подобрал звезду — сервер проверяет уникальность starId
    * (анти-даблпик) и, если она ещё не была засчитана, рассылает новый общий
-   * счёт всей комнате (см. drainStarCollected). */
-  public requestStarPickup(level: number, starId: string): void {
-    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return
-    this.socket.emit("starPickup", { roomId: this.roomInfo.roomId, level, epoch: this.epoch, starId })
+   * счёт всей комнате (см. drainStarCollected). В отличие от reportWallHit
+   * выше (fire-and-forget), тут нужен именно ack — GameScene.tryPickupStar
+   * прячет звезду ОПТИМИСТИЧНО (до ответа сервера) и должен уметь откатить
+   * это, если ответ говорит "нет" (устаревший level/epoch) или не приходит
+   * вовсе. starPickupTimeoutMs — защита именно от последнего случая: голый
+   * emit с ack callback, в отличие от HTTP-запроса, сам по себе никогда не
+   * таймаутится — если сокет отвалится, не успев доставить ответ, колбэк
+   * просто никогда не вызовется. */
+  private readonly starPickupTimeoutMs = 4000
+
+  public async requestStarPickup(level: number, starId: string): Promise<StarPickupAck> {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return { ok: false, reason: "not-coop" }
+
+    const socket = this.socket
+    const payload = { roomId: this.roomInfo.roomId, level, epoch: this.epoch, starId }
+
+    return new Promise((resolve) => {
+      let settled = false
+
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        resolve({ ok: false, reason: "timeout" })
+      }, this.starPickupTimeoutMs)
+
+      socket.emit("starPickup", payload, (ack) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(ack)
+      })
+    })
+  }
+
+  /** Дефенсивно подтягивает общий счёт, если он оказался выше уже известного
+   * (см. GameScene.tryPickupStar — случай "звезду забрал напарник", где
+   * широковещательный starCollected от НЕГО в теории мог ещё не дойти к моменту,
+   * когда наш собственный (отклонённый) ack на ту же звезду уже пришёл).
+   * Никогда не двигает счёт назад — это не источник истины, только подстраховка. */
+  public reconcileTeamStars(teamStars: number): void {
+    if (teamStars <= this.teamStars) return
+    this.teamStars = teamStars
+    this.notify()
   }
 
   /** Локальный игрок зажёг факел-выключатель — действует на всю комнату. */
@@ -705,8 +825,7 @@ export class GameNetworkStore {
 
     const result: EnemyNetState[] = []
     for (const buffer of this.enemyBuffers.values()) {
-      const span = buffer.nextAt - buffer.prevAt
-      const t = span > 0 ? Math.min(1, Math.max(0, (renderTime - buffer.prevAt) / span)) : 1
+      const t = interpolationFactor(buffer.prevAt, buffer.nextAt, renderTime)
 
       const rotationDiff = Math.atan2(Math.sin(buffer.next.rotation - buffer.prev.rotation), Math.cos(buffer.next.rotation - buffer.prev.rotation))
 

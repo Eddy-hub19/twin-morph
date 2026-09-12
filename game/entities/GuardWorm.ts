@@ -1,6 +1,6 @@
 import { Assets, Sprite, Texture } from "pixi.js"
 import { Entity } from "./Entity"
-import { Wall, findWallAt } from "./Wall"
+import { findWallAt, type WallLookup } from "./Wall"
 import type { EnemyNetState } from "../../shared/game-protocol"
 import {
   GUARD_PATROL_SPEED as PATROL_SPEED,
@@ -161,7 +161,7 @@ export class GuardWorm extends Entity {
    * TARGET_SWITCH_COOLDOWN секунд, иначе при равной дистанции цель дрожала
    * бы между игроками каждый кадр. Вражеских воров стражу вообще не передают.
    */
-  public tick(deltaTime: number, walls: Wall[] = [], players: GuardTarget[] = []): void {
+  public tick(deltaTime: number, wallLookup: WallLookup, players: GuardTarget[] = []): void {
     if (!this.sprite) {
       return
     }
@@ -245,7 +245,7 @@ export class GuardWorm extends Entity {
 
     const margin = GUARD_AREA_MARGIN
     const outOfBounds = nextY < this.areaTop + margin || nextY > this.areaTop + this.areaHeight - margin
-    const blocked = outOfBounds || Boolean(findWallAt(walls, nextX, nextY))
+    const blocked = outOfBounds || Boolean(findWallAt(wallLookup, nextX, nextY))
 
     if (blocked) {
       // Страж не роет — любая непрокопанная стена для него непроходима.

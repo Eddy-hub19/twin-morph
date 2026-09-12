@@ -1,7 +1,7 @@
 import { Assets, AnimatedSprite, Container, Texture } from "pixi.js"
 import { Entity } from "./Entity"
 import { PlayerCosmetics, type PartnerRole } from "./PlayerCosmetics"
-import { FROG_SPEED, FROG_DESIRED_HEIGHT, FROG_ANALOG_DEADZONE } from "../config/GameConfig"
+import { FROG_SPEED, FROG_DESIRED_HEIGHT, FROG_ANALOG_DEADZONE, REMOTE_PLAYER_SMOOTHING } from "../config/GameConfig"
 
 const DESIRED_HEIGHT = FROG_DESIRED_HEIGHT
 
@@ -24,6 +24,11 @@ const SWIM_FRAME_PATHS = Array.from({ length: SWIM_FRAME_COUNT }, (_, i) => `/as
  * ввода — см. GameScene.upsertRemoteEntity/PlayerForm.
  */
 export class Frog extends Entity {
+  // Спрайт центрирован (sprite.anchor.set(0.5)) — см. комментарий у
+  // Worm.originX/Y, тот же принцип.
+  protected override originX = 0.5
+  protected override originY = 0.5
+
   public isDead = false
 
   private sprite!: AnimatedSprite
@@ -150,12 +155,14 @@ export class Frog extends Entity {
 
   /** Ставит жабу в позицию, полученную по сети — задел на будущее (co-op на
    * уровне воды сейчас не поддержан, см. комментарий у класса), по образцу
-   * Ant.setRemotePosition/Worm.setRemotePosition. */
-  public setRemotePosition(x: number, y: number): void {
+   * Ant.setRemotePosition/Worm.setRemotePosition (см. комментарий там же про
+   * REMOTE_PLAYER_SMOOTHING — плавно доводимся, а не телепортируемся). */
+  public setRemotePosition(x: number, y: number, deltaTime: number): void {
     if (!this.sprite || this.isDead) return
 
     const dx = x - this.container.x
-    const isMoving = Math.hypot(dx, y - this.container.y) > 0.3
+    const dy = y - this.container.y
+    const isMoving = Math.hypot(dx, dy) > 0.3
 
     if (isMoving) {
       this.sprite.scale.x = dx < 0 ? -Math.abs(this.sprite.scale.y) : Math.abs(this.sprite.scale.y)
@@ -164,7 +171,8 @@ export class Frog extends Entity {
       this.sprite.gotoAndStop(0)
     }
 
-    this.container.x = x
-    this.container.y = y
+    const smoothing = Math.min(1, REMOTE_PLAYER_SMOOTHING * deltaTime)
+    this.container.x += dx * smoothing
+    this.container.y += dy * smoothing
   }
 }

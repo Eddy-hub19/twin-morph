@@ -29,6 +29,7 @@ import type {
   PlayerPosePayload,
   PlayerTransformPayload,
   RoomRestartRequestPayload,
+  StarPickupAck,
   StarPickupPayload,
   WallHitPayload,
 } from "../../../shared/game-protocol"
@@ -193,16 +194,23 @@ export class GameGateway implements OnGatewayInit, OnGatewayDisconnect {
   }
 
   @SubscribeMessage("starPickup")
-  public handleStarPickup(@ConnectedSocket() client: GameSocket, @MessageBody() payload: StarPickupPayload): void {
+  public handleStarPickup(@ConnectedSocket() client: GameSocket, @MessageBody() payload: StarPickupPayload): StarPickupAck {
     const roomId = client.data.roomId
-    if (!roomId || roomId !== payload.roomId) return
+    if (!roomId || roomId !== payload.roomId) return { ok: false, reason: "not-in-room" }
 
-    const teamStars = this.levelState.collectStar(roomId, payload.level, payload.starId)
-    if (teamStars === null) return // уже засчитана кем-то раньше — не даём засчитать дважды
+    const result = this.levelState.collectStar(roomId, payload.level, payload.starId)
+    if (!result.ok) {
+      // Не даём засчитать дважды — либо устаревший level/эпоха (клиент
+      // должен откатить свой оптимистичный подбор, см. StarPickupAck), либо
+      // её только что забрал кто-то другой (откатывать нечего, звезда и так
+      // должна остаться скрытой у отправителя — см. GameScene.tryPickupStar).
+      return { ok: false, alreadyCollected: result.alreadyCollected, teamStars: result.teamStars, reason: result.reason }
+    }
 
     // Рассылаем ВСЕЙ комнате, включая отправителя — единственный источник
     // истины про общий счёт, а не локальный оптимистичный инкремент.
-    this.server.to(roomId).emit("starCollected", { level: payload.level, epoch: payload.epoch, starId: payload.starId, teamStars })
+    this.server.to(roomId).emit("starCollected", { level: payload.level, epoch: payload.epoch, starId: payload.starId, teamStars: result.teamStars })
+    return { ok: true, teamStars: result.teamStars }
   }
 
   @SubscribeMessage("lightActivate")

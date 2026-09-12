@@ -251,6 +251,24 @@ export interface StarPickupPayload {
   starId: string
 }
 
+export interface StarPickupAck {
+  ok: boolean
+  /** true — эту звезду только что забрал НЕ отправитель (кто-то другой в
+   * комнате), не ошибка сама по себе, а нормальный исход гонки за одну
+   * звезду (см. GameScene.tryPickupStar): звезда остаётся скрытой, но
+   * локальный счёт этому игроку не начисляется. */
+  alreadyCollected?: boolean
+  /** Общий счёт команды на момент ответа — при ok:true совпадает с тем, что
+   * придёт следующим же широковещательным starCollected (см. StarCollectedPayload),
+   * а при alreadyCollected:true позволяет подтянуть актуальный счёт, даже
+   * если широковещательное событие чужого подбора почему-то ещё не дошло. */
+  teamStars?: number
+  /** Причина отказа — "stale-level" (комната уже перешла на другой
+   * уровень/эпоху, пока ответ шёл) или "not-in-room". Не используется для
+   * alreadyCollected — там reason не нужен, это не ошибка. */
+  reason?: string
+}
+
 export interface StarCollectedPayload {
   level: number
   epoch: number
@@ -452,7 +470,7 @@ export interface ClientToServerEvents {
    * ВСЕЙ комнаты, иначе карты игроков тут же разошлись бы. */
   roomRestart: (payload: RoomRestartRequestPayload) => void
   wallHit: (payload: WallHitPayload) => void
-  starPickup: (payload: StarPickupPayload) => void
+  starPickup: (payload: StarPickupPayload, ack: (response: StarPickupAck) => void) => void
   lightActivate: (payload: LightActivatePayload) => void
   boostActivate: (payload: BoostActivatePayload) => void
   /** Периодически шлёт только "хост" комнаты (см. game/network — первый по
