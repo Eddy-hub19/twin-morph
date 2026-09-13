@@ -43,8 +43,14 @@ export class LevelStateService {
    * игроков первым запросил хоть один водный сегмент), как и
    * RoomLevelState.width/height для уровней 0/1. */
   private waterDimsByRoom = new Map<string, { width: number; height: number } | null>()
-  /** roomId -> (номер уровня -> seed этого сегмента). */
-  private waterSegmentsByRoom = new Map<string, Map<number, { seed: number }>>()
+  /** roomId -> (номер уровня -> состояние этого сегмента). collectedItemIds/
+   * keyFound/passageEntered актуальны только для level === 3 (см. комментарий
+   * у WaterSegmentState в shared/game-protocol.ts) — для других номеров
+   * (сейчас таких и не бывает) остаются в дефолте, безвредно. */
+  private waterSegmentsByRoom = new Map<
+    string,
+    Map<number, { seed: number; collectedItemIds: string[]; keyFound: boolean; passageEntered: boolean }>
+  >()
 
   public getEpoch(roomId: string): number {
     return this.epochByRoom.get(roomId) ?? 0
@@ -268,11 +274,79 @@ export class LevelStateService {
 
     let segment = segments.get(level)
     if (!segment) {
-      segment = { seed: randomSeed() }
+      segment = { seed: randomSeed(), collectedItemIds: [], keyFound: false, passageEntered: false }
       segments.set(level, segment)
     }
 
-    return { level, seed: segment.seed, width: dims.width, height: dims.height }
+    return {
+      level,
+      seed: segment.seed,
+      width: dims.width,
+      height: dims.height,
+      collectedItemIds: segment.collectedItemIds,
+      keyFound: segment.keyFound,
+      passageEntered: segment.passageEntered,
+    }
+  }
+
+  /** Текущее состояние сегмента level (кувшинки/ключ/проход) без побочного
+   * создания — null, если для него ещё никто не звал ensureWaterSegment (см.
+   * JoinRoomAck.waterLevelState — снапшот для нового/переподключившегося
+   * игрока, "заводить" сегмент только ради чтения не нужно). */
+  public getWaterSegmentState(roomId: string, level: number): WaterSegmentState | null {
+    const dims = this.waterDimsByRoom.get(roomId)
+    const segment = this.waterSegmentsByRoom.get(roomId)?.get(level)
+    if (!dims || !segment) return null
+
+    return {
+      level,
+      seed: segment.seed,
+      width: dims.width,
+      height: dims.height,
+      collectedItemIds: segment.collectedItemIds,
+      keyFound: segment.keyFound,
+      passageEntered: segment.passageEntered,
+    }
+  }
+
+  /** Уровень 3 — засчитывает подбор кувшинки/ключа: null, если этот itemId (по
+   * id) уже был собран раньше (анти-даблпик, тот же принцип, что и
+   * collectStar). Возвращает актуальное keyFound — важно даже для подбора
+   * НЕ-ключа: клиент должен знать, найден ли ключ КЕМ-ТО ДРУГИМ, не только
+   * этим конкретным событием. */
+  public collectWaterItem(
+    roomId: string,
+    level: number,
+    itemId: string,
+    isKey: boolean,
+  ): { collectedItemIds: string[]; keyFound: boolean } | null {
+    const segment = this.waterSegmentsByRoom.get(roomId)?.get(level)
+    if (!segment) return null
+    if (segment.collectedItemIds.includes(itemId)) return null
+
+    segment.collectedItemIds.push(itemId)
+    if (isKey) segment.keyFound = true
+
+    return { collectedItemIds: segment.collectedItemIds, keyFound: segment.keyFound }
+  }
+
+  /**
+   * Уровень 3 — кто-то коснулся уже открытого прохода: null, если ключ ещё не
+   * найден (клиент не должен был вообще прислать это событие — защита не
+   * доверяет клиенту) или проход уже был пройден раньше (повторный вход не
+   * создаёт уровень 4 заново, у комнаты он уже есть). При успехе — заводит
+   * СВЕЖИЙ RoomLevelState уровня 4 (см. createFreshLevel) тем же способом,
+   * что и обычный advanceLevel, только "из воды", а не из levelByRoom.
+   */
+  public enterWaterPassage(roomId: string, level: number, width: number, height: number): RoomLevelState | null {
+    const segment = this.waterSegmentsByRoom.get(roomId)?.get(level)
+    if (!segment || !segment.keyFound || segment.passageEntered) return null
+
+    segment.passageEntered = true
+
+    const levelState = this.createFreshLevel(4, width, height)
+    this.levelByRoom.set(roomId, levelState)
+    return levelState
   }
 
   public removeRoom(roomId: string): void {

@@ -1,6 +1,7 @@
 import { Graphics } from "pixi.js"
 import { Entity } from "./Entity"
 import type { MaterialKind } from "./Material"
+import { LEAF_SIZE } from "../config/GameConfig"
 
 /** Что можно установить в слот — обычный материал (лист/ветка, любой из
  * MaterialKind) или, только для последнего слота, большая ветка. */
@@ -45,18 +46,36 @@ export class BridgeSlot extends Entity {
 
     this.platform.clear()
     if (kind === "bigBranch") {
+      // Как и у листиков ниже — планка лежит только у поверхности (самого
+      // начала) воды, не тянется на всю глубину увеличенного пруда: иначе
+      // единственный слот выглядел бы сплошной коричневой стеной на фоне
+      // мелких листиков у остальных.
+      const plankHeight = Math.min(this.height, LEAF_SIZE * 1.4)
       this.platform.beginFill(0x6b4a2b)
-      this.platform.drawRoundedRect(0, 0, this.width, this.height, 4)
+      this.platform.drawRoundedRect(0, 0, this.width, plankHeight, 4)
       this.platform.endFill()
       this.platform.lineStyle(2, 0x4a3218)
-      this.platform.moveTo(4, this.height / 2)
-      this.platform.lineTo(this.width - 4, this.height / 2)
+      this.platform.moveTo(4, plankHeight / 2)
+      this.platform.lineTo(this.width - 4, plankHeight / 2)
     } else {
-      const leafCount = Math.max(2, Math.round(this.width / (this.height * 0.9)))
+      // Листики маленькие и фиксированного размера (тот же LEAF_SIZE, что и
+      // у одиночного подбираемого листа) — не растянутые под ширину/высоту
+      // слота, поэтому остаются маленькими даже когда пруд стал шире и
+      // заметно глубже. Горизонтальный овал (шире, чем выше), та же
+      // пропорция, что и у Leaf.ts (X/2 к X/2.6). Лежат только у самой
+      // поверхности воды (leafCenterY у верхнего края слота) — глубже, в
+      // толщу увеличенного пруда, не тянутся, это просто фон.
+      const leafRadiusX = LEAF_SIZE / 2
+      const leafRadiusY = LEAF_SIZE / 2.6
+      // ceil + нахлёст (0.85 от диаметра), чтобы соседние листики
+      // перекрывались и не оставляли щели воды между собой по ширине слота.
+      const leafCount = Math.max(2, Math.ceil(this.width / (LEAF_SIZE * 0.85)))
+      const leafSpacing = this.width / leafCount
+      const leafCenterY = Math.min(this.height / 2, leafRadiusY + 3)
       for (let i = 0; i < leafCount; i++) {
-        const lx = (this.width / leafCount) * (i + 0.5)
+        const lx = leafSpacing * (i + 0.5)
         this.platform.beginFill(0x5cb85c)
-        this.platform.drawEllipse(lx, this.height / 2, this.width / leafCount / 1.6, this.height / 2.2)
+        this.platform.drawEllipse(lx, leafCenterY, leafRadiusX, leafRadiusY)
         this.platform.endFill()
       }
     }

@@ -12,6 +12,7 @@ import {
   ANT_LEAF_RISE,
   ANT_ANALOG_DEADZONE,
   DROWN_FLAIL_DURATION,
+  DROWN_SINK_DEPTH,
   MATERIAL_SIZE,
   REMOTE_PLAYER_SMOOTHING,
 } from "../config/GameConfig"
@@ -45,6 +46,12 @@ const LEAF_SCALE = ANT_LEAF_SCALE
 const LEAF_DURATION = ANT_LEAF_DURATION // секунд — сколько висит листочек на усике после подбора звезды
 const LEAF_RISE = ANT_LEAF_RISE // px, на сколько листочек всплывает вверх за время показа
 
+// Нижняя точка ножек (самая большая y-координата среди путей ног в
+// ant-flat.svg/walk-flat/*, поза покоя) — якорь спрайта ставим сюда, а не на
+// глаз "0.85", иначе муравей визуально висит над травой (его реальные ноги
+// заметно ниже 85% высоты текстуры).
+const FEET_FY = (50 + 10) / 62
+
 // Кончик уса в координатах viewBox ant-flat.svg (0 -10 100 62) — сюда
 // цепляем листочек. Взято по позе покоя (кадр 0 цикла ходьбы).
 const ANTENNA_TIP_FX = 90 / 100
@@ -74,6 +81,13 @@ export class Ant extends Entity {
   private leafSprite?: Sprite
   private deadTextures: Texture[] = []
   private leafTimer = 0
+  /** Множитель scale.set() спрайта из applyTextureScale — сохраняем отдельно,
+   * чтобы во время утопления домножать на него (сжатие при погружении), не
+   * теряя исходный масштаб под ANT_DESIRED_HEIGHT. */
+  private baseScale = 1
+  /** "Яма" в воде под ногами, куда муравей визуально уходит при утоплении —
+   * см. drown()/finishDrowning(). */
+  private pit!: Graphics
 
   /** "Борсается" перед тем, как утонуть (см. drown()) — во время этого
    * движение/подбор звёзд не обрабатываются, но isDead ещё false (иначе
@@ -125,10 +139,11 @@ export class Ant extends Entity {
   /**
    * Топит муравья (уровень 3, индекс 2 — пруд без наведённого моста): в
    * отличие от kill() не убивает мгновенно, а сперва даёт короткое время
-   * "побарсаться" (DROWN_FLAIL_DURATION) — за это время сама update() не
-   * пускает муравья дальше/не даёт подбирать предметы, но isDead ещё false.
-   * По истечении таймера ставит diedFromDrowning и honestly убивает через
-   * тот же kill() (те же dead-кадры), чтобы не дублировать анимацию смерти.
+   * "побарсаться" (DROWN_FLAIL_DURATION), за которое муравей уходит вниз в
+   * "яму" (pit) под ногами — тонет, а не просто падает замертво на воде, как
+   * от kill(). Всё это время сама update() не пускает муравья дальше/не даёт
+   * подбирать предметы, но isDead ещё false. По истечении таймера
+   * finishDrowning() честно ставит isDead/diedFromDrowning.
    */
   public drown(): void {
     if (this.isDead || this.isDrowning) return
@@ -137,6 +152,21 @@ export class Ant extends Entity {
     this.drownFlailTimer = DROWN_FLAIL_DURATION
     this.leafTimer = 0
     if (this.leafSprite) this.leafSprite.visible = false
+    if (this.jawsSprite) this.jawsSprite.visible = false
+
+    this.pit.visible = true
+    this.pit.alpha = 0
+  }
+
+  /** Завершает утопление (drownFlailTimer истёк) — прячет муравья и яму под
+   * ним, без анимации "упал замертво", которую использует обычный kill()
+   * (та рассчитана на смерть на суше от врага, не на уход под воду). */
+  private finishDrowning(): void {
+    this.isDrowning = false
+    this.isDead = true
+    this.diedFromDrowning = true
+    this.sprite.visible = false
+    this.pit.visible = false
   }
 
   constructor(input: any, x: number, y: number) {
@@ -173,10 +203,18 @@ export class Ant extends Entity {
 
     this.deadTextures = deadTextures
 
+    // "Яма" в воде под ногами — тёмное плоское пятно, скрытое, пока не
+    // начнётся утопление (см. drown()); добавляем ДО спрайта муравья, чтобы
+    // рисовалось под ним, а не поверх.
+    this.pit = new Graphics()
+    this.pit.visible = false
+    this.container.addChild(this.pit)
+
     this.sprite = new AnimatedSprite(walkTextures)
     // Якорь внизу по центру — муравей стоит на земле своими ножками, а не
-    // висит в воздухе серединой тела.
-    this.sprite.anchor.set(0.5, 0.85)
+    // висит в воздухе серединой тела (см. FEET_FY — реальная нижняя точка
+    // ножек в SVG, а не круглое число "0.85").
+    this.sprite.anchor.set(0.5, FEET_FY)
     this.sprite.animationSpeed = 0.22
     this.sprite.loop = true
     // Кадр 0 — поза покоя, показываем её, пока муравей не пошёл.
@@ -185,6 +223,11 @@ export class Ant extends Entity {
     this.container.addChild(this.sprite)
 
     this.applyTextureScale(walkTextures[0])
+
+    this.pit.clear()
+    this.pit.beginFill(0x0c2f42, 0.6)
+    this.pit.drawEllipse(0, 0, DESIRED_HEIGHT * 1.1, DESIRED_HEIGHT * 0.55)
+    this.pit.endFill()
 
     this.leafSprite = new Sprite(leafTexture)
     this.leafSprite.anchor.set(0.5)
@@ -207,6 +250,7 @@ export class Ant extends Entity {
     if (!texture.height) return
 
     const scaleFactor = DESIRED_HEIGHT / texture.height
+    this.baseScale = scaleFactor
     this.sprite.scale.set(scaleFactor)
   }
 
@@ -332,16 +376,22 @@ export class Ant extends Entity {
     if (this.isDead) return
 
     if (this.isDrowning) {
-      // Короткая хаотичная хитавиця вместо ходьбы — ничего не подбираем и
-      // никуда не идём, пока не истечёт таймер (см. drown()).
+      // Хаотичная хитавиця, затухающая по мере погружения (progress: 0 —
+      // только начал тонуть, 1 — таймер истёк) — вместо ходьбы муравей
+      // уходит вниз в яму под собой (sprite.y, не container.y — камера
+      // следит за container каждый кадр, см. DROWN_SINK_DEPTH), сжимаясь и
+      // растворяясь, а яма проступает под ним.
       this.drownFlailTimer -= deltaTime
-      this.sprite.rotation = Math.sin(this.drownFlailTimer * 40) * 0.25
+      const progress = 1 - Math.max(0, this.drownFlailTimer) / DROWN_FLAIL_DURATION
+
+      this.sprite.rotation = Math.sin(this.drownFlailTimer * 40) * 0.25 * (1 - progress)
+      this.sprite.y = progress * DROWN_SINK_DEPTH
+      this.sprite.alpha = 1 - progress
+      this.sprite.scale.set(this.baseScale * (1 - progress * 0.4))
+      this.pit.alpha = Math.min(1, progress * 2.5)
 
       if (this.drownFlailTimer <= 0) {
-        this.isDrowning = false
-        this.sprite.rotation = 0
-        this.diedFromDrowning = true
-        this.kill()
+        this.finishDrowning()
       }
       return
     }

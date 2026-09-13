@@ -182,6 +182,12 @@ export interface JoinRoomAck {
    * позднему присоединению/реконнекту сразу заспавниться жабой на нужном
    * сегменте, минуя кат-сцену метаморфозы (см. GameScene.startCoopLevel). */
   frogProgress?: number | null
+  /** Текущее состояние уровня 3 (кувшинки/ключ/проход), если комната до него
+   * уже добралась — null, если ещё никто не доплывал. В отличие от
+   * frogProgress выше это ОБЩЕЕ для комнаты состояние (см. WaterSegmentState),
+   * нужное реконнекту/позднему игроку, чтобы не собирать уже найденный
+   * партнёром ключ заново. */
+  waterLevelState?: WaterSegmentState | null
 }
 
 export interface EnsureLevelPayload {
@@ -317,17 +323,24 @@ export interface EnemyStatePayload {
 }
 
 // ---------------------------------------------------------------------------
-// Уровни 3+ (жаба, вода) — в отличие от уровней 0/1/2 выше, тут НЕТ единого
-// "текущего уровня комнаты": прогресс каждого игрока независим (никакой
-// общей "двери", которую нужно проходить обоим сразу, тут не существует —
-// каждый доплывает до края своего экрана и переходит на следующий сегмент
-// сам, в своём темпе). Поэтому вместо одного replace-on-advance слота (как
-// RoomLevelState) — независимое, растущее хранилище НА КАЖДЫЙ номер уровня:
-// кто первый из игроков комнаты доплыл до сегмента N — тот и закрепляет его
-// seed/размер (см. LevelStateService.ensureWaterSegment), второй игрок,
-// доплыв туда позже (или после реконнекта), получает ТЕ ЖЕ значения, а не
-// генерирует свои. Больше тут шарить нечего — на воде нет ни стен, ни
-// звёзд, ни врагов.
+// Уровень 3 (жаба, единственный водный уровень — большой вертикальный
+// водоём) — в отличие от уровней 0/1/2 выше, тут НЕТ единой "двери": войти в
+// него каждый игрок комнаты может в своём темпе (см. frogProgress), никакого
+// общего old-school "оба должны одновременно дойти до X" тут не требуется.
+// Поэтому вместо одного replace-on-advance слота (как RoomLevelState) —
+// растущее хранилище НА КАЖДЫЙ номер уровня: кто первый из игроков комнаты
+// доплыл до сегмента N — тот и закрепляет его seed/размер (см.
+// LevelStateService.ensureWaterSegment), второй игрок получает ТЕ ЖЕ
+// значения, а не генерирует свои.
+//
+// НО: кувшинки/ключ/проход (collectedItemIds/keyFound/passageEntered ниже) —
+// уже общее для комнаты состояние, тем же принципом "первый забрал —
+// навсегда для всех", что и RoomLevelState.collectedItemIds. А как только
+// кто-то из игроков реально входит в открытый проход — это ЕДИНСТВЕННЫЙ
+// момент за всю водную фазу, когда снова нужна общая "дверь": сервер разом
+// создаёт RoomLevelState уровня 4 и рассылает его ОБОИМ (см.
+// WaterPassageEnteredPayload) — оба честно проходят метаморфозу обратно в
+// червя и оказываются на уровне 4 вместе, а не по отдельности.
 // ---------------------------------------------------------------------------
 
 /** Полное состояние одного водного сегмента (уровня 3+) — минимальный аналог
@@ -341,6 +354,23 @@ export interface WaterSegmentState {
    * координаты между клиентами с разным размером экрана. */
   width: number
   height: number
+  /**
+   * Уровень 3 (единственный водный уровень — большой вертикальный водоём с
+   * кувшинками/ключом/подводным проходом, см. GameScene.generateNextLevel) —
+   * в отличие от остального в этом интерфейсе (независимый прогресс на
+   * игрока), эти три поля НАРОЧНО общие для всей комнаты сразу, тем же
+   * принципом "первый забрал — навсегда для всех", что и
+   * RoomLevelState.collectedItemIds/bridgeSlots.
+   */
+  collectedItemIds: string[]
+  /** true, как только КТО-ТО из игроков комнаты подобрал ключ ("3:key") —
+   * навсегда, открывает SubmergedPassage сразу для ОБОИХ. */
+  keyFound: boolean
+  /** true, как только кто-то из игроков реально вошёл в уже открытый проход —
+   * сервер в этот момент разом создаёт RoomLevelState уровня 4 и рассылает
+   * его ОБОИМ игрокам (см. WaterPassageEnteredPayload) — навсегда, повторно
+   * войти нельзя (и не нужно). */
+  passageEntered: boolean
 }
 
 export interface EnsureWaterSegmentPayload {
@@ -353,6 +383,46 @@ export interface EnsureWaterSegmentPayload {
 export interface EnsureWaterSegmentAck {
   ok: boolean
   segment?: WaterSegmentState
+}
+
+/** Уровень 3 — подбор кувшинки ИЛИ ключа (isKey отличает их, оба используют
+ * один и тот же канал/тот же общий collectedItemIds, см. WaterSegmentState). */
+export interface WaterItemPickupPayload {
+  roomId: string
+  level: number
+  itemId: string
+  isKey: boolean
+}
+
+export interface WaterItemCollectedPayload {
+  level: number
+  itemId: string
+  isKey: boolean
+  /** true, если этим самым подбором (или каким-то более ранним) ключ уже
+   * найден — клиент открывает SubmergedPassage именно по этому флагу, а не
+   * по isKey текущего события (тому, кто подключился позже, нужно узнать
+   * актуальное состояние, а не только "что случилось только что"). */
+  keyFound: boolean
+}
+
+/** Игрок коснулся уже открытого (ключ найден) прохода — просит сервер
+ * зафиксировать переход всей комнаты на уровень 4. width/height — собственный
+ * digLevelWidth()/Height() отправителя, тот же принцип, что и у
+ * AdvanceLevelPayload (используются, только если для level 4 ЕЩЁ нет
+ * состояния). */
+export interface WaterPassageEnterPayload {
+  roomId: string
+  level: number
+  width: number
+  height: number
+}
+
+/** Рассылается ОБОИМ игрокам комнаты сразу, как только переход зафиксирован —
+ * levelState уровня 4 создаётся тут же, на сервере, поэтому оба клиента
+ * получают один и тот же seed/размер без отдельного round-trip'а (см.
+ * GameScene.applyWaterPassageEntered). */
+export interface WaterPassageEnteredPayload {
+  levelState: RoomLevelState
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +559,11 @@ export interface ClientToServerEvents {
    * комната была на одном номере уровня: у каждого игрока свой независимый
    * прогресс по воде (см. LevelStateService.ensureWaterSegment). */
   ensureWaterSegment: (payload: EnsureWaterSegmentPayload, ack: (response: EnsureWaterSegmentAck) => void) => void
+  /** Уровень 3 — подобрал кувшинку/ключ (см. WaterItemPickupPayload). */
+  waterItemPickup: (payload: WaterItemPickupPayload) => void
+  /** Уровень 3 — коснулся уже открытого прохода, просит перевести всю комнату
+   * на уровень 4 разом (см. WaterPassageEnteredPayload). */
+  waterPassageEnter: (payload: WaterPassageEnterPayload) => void
 }
 
 export interface ServerToClientEvents {
@@ -509,6 +584,8 @@ export interface ServerToClientEvents {
   materialUpdated: (payload: MaterialUpdatedPayload) => void
   slotUpdated: (payload: SlotUpdatedPayload) => void
   bigBranchState: (payload: BigBranchStatePayload) => void
+  waterItemCollected: (payload: WaterItemCollectedPayload) => void
+  waterPassageEntered: (payload: WaterPassageEnteredPayload) => void
 }
 
 // ---------------------------------------------------------------------------

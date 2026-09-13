@@ -30,21 +30,6 @@ function setRoomInUrl(roomId: string | null): void {
   window.history.replaceState(null, "", url.toString())
 }
 
-/** Достаёт roomId из введённого игроком текста — это может быть либо целая
- * скопированная ссылка-приглашение (?room=<id> где-то в адресе), либо сам
- * код комнаты, вставленный/введённый напрямую. */
-function extractRoomId(input: string): string {
-  const trimmed = input.trim()
-  try {
-    const url = new URL(trimmed)
-    return url.searchParams.get(ROOM_QUERY_PARAM) ?? trimmed
-  } catch {
-    return trimmed
-  }
-}
-
-type View = "main" | "settings" | "join"
-
 /**
  * Экран выбора режима перед стартом. Single Player стартует мгновенно, без
  * сети. Co-op подключается к NestJS-серверу через useGameSocket и ждёт ack
@@ -55,9 +40,7 @@ type View = "main" | "settings" | "join"
  * Подключение к комнате по ссылке: если открыть страницу с ?room=<id> в
  * адресе (ссылка, которую скопировал/отправил первый игрок — см.
  * RoomStatusBadge), экран сразу предлагает присоединиться именно к этой
- * комнате, а не к случайной свободной. Тот же путь доступен и вручную —
- * кнопка "Приєднатися до кімнати" (view === "join") просит вставить ту же
- * ссылку или голый код комнаты.
+ * комнате, а не к случайной свободной.
  */
 export default function ModeSelect({ onReady }: ModeSelectProps) {
   const { startSolo, startCoop } = useGameSocket()
@@ -65,8 +48,6 @@ export default function ModeSelect({ onReady }: ModeSelectProps) {
   const [elapsedMs, setElapsedMs] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [invitedRoomId, setInvitedRoomId] = useState<string | null>(null)
-  const [view, setView] = useState<View>("main")
-  const [joinCode, setJoinCode] = useState("")
 
   useEffect(() => {
     const roomId = new URLSearchParams(window.location.search).get(ROOM_QUERY_PARAM)
@@ -121,13 +102,6 @@ export default function ModeSelect({ onReady }: ModeSelectProps) {
     }
   }
 
-  const handleJoinSubmit = (e: React.FormEvent) => {
-    e.preventDefault()
-    const roomId = extractRoomId(joinCode)
-    if (!roomId) return
-    handleCoop(roomId)
-  }
-
   if (isConnecting) {
     return <ServerLoadingScreen elapsedMs={elapsedMs} isLocal={isLocalServerUrl(getGameServerUrl())} />
   }
@@ -157,56 +131,6 @@ export default function ModeSelect({ onReady }: ModeSelectProps) {
     )
   }
 
-  if (view === "settings") {
-    return (
-      <div className={styles.overlay}>
-        <h1 className={styles.title}>Налаштування</h1>
-
-        <div className={styles.panel}>
-          <h2 className={styles.panelHeading}>Керування</h2>
-          <ul className={styles.hintList}>
-            <li>Стрілки або WASD — рух</li>
-            <li>На телефоні/планшеті внизу праворуч з&apos;являється сенсорний джойстик</li>
-            <li>Escape або кнопка ⏸ у грі — пауза</li>
-          </ul>
-        </div>
-
-        <button className={styles.backButton} onClick={() => setView("main")}>
-          ← Назад
-        </button>
-      </div>
-    )
-  }
-
-  if (view === "join") {
-    return (
-      <div className={styles.overlay}>
-        <h1 className={styles.title}>Приєднатися до кімнати</h1>
-        <p className={styles.subtitle}>Встав посилання-запрошення або код кімнати, який тобі надіслали.</p>
-
-        <form className={styles.joinForm} onSubmit={handleJoinSubmit}>
-          <input
-            className={styles.joinInput}
-            type="text"
-            value={joinCode}
-            onChange={(e) => setJoinCode(e.target.value)}
-            placeholder="Посилання або код кімнати"
-            autoFocus
-          />
-          <button type="submit" className={styles.joinSubmit} disabled={!joinCode.trim()}>
-            Приєднатися
-          </button>
-        </form>
-
-        <div className={styles.status}>{error && <span className={styles.error}>{error}</span>}</div>
-
-        <button className={styles.backButton} onClick={() => setView("main")}>
-          ← Назад
-        </button>
-      </div>
-    )
-  }
-
   return (
     <div className={styles.overlay}>
       <h1 className={styles.title}>Twin Morph</h1>
@@ -223,18 +147,6 @@ export default function ModeSelect({ onReady }: ModeSelectProps) {
           <span className={styles.optionIcon}>🐜</span>
           <span className={styles.optionLabel}>Створити кімнату</span>
           <span className={styles.optionHint}>Запросити напарника</span>
-        </button>
-
-        <button className={styles.option} onClick={() => setView("join")} disabled={isConnecting}>
-          <span className={styles.optionIcon}>🔗</span>
-          <span className={styles.optionLabel}>Приєднатися до кімнати</span>
-          <span className={styles.optionHint}>За посиланням або кодом</span>
-        </button>
-
-        <button className={styles.option} onClick={() => setView("settings")} disabled={isConnecting}>
-          <span className={styles.optionIcon}>⚙️</span>
-          <span className={styles.optionLabel}>Налаштування</span>
-          <span className={styles.optionHint}>Керування</span>
         </button>
       </div>
 

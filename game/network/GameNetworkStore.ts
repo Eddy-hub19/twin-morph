@@ -24,6 +24,8 @@ import {
   type StarCollectedPayload,
   type StarPickupAck,
   type WallUpdatedPayload,
+  type WaterItemCollectedPayload,
+  type WaterPassageEnteredPayload,
   type WaterSegmentState,
 } from "@/shared/game-protocol"
 
@@ -173,6 +175,14 @@ export class GameNetworkStore {
    * bootstrap (см. GameScene.startCoopLevel) — сама водная фаза (уровни 3+)
    * не имеет единого "текущего уровня комнаты", в отличие от levelState выше. */
   private frogProgress: number | null = null
+  /** Уровень 3 — актуальное общее состояние комнаты (кувшинки/ключ/проход),
+   * если она до него уже добралась — из JoinRoomAck.waterLevelState и из
+   * каждого ensureWaterSegment/waterItemCollected после. Нужно, чтобы
+   * поздний/переподключившийся игрок не пытался собрать уже найденный
+   * партнёром ключ заново (см. GameScene.prepareWaterSegment). */
+  private waterLevelState: WaterSegmentState | null = null
+  private waterItemCollectedQueue: WaterItemCollectedPayload[] = []
+  private pendingWaterPassageEntered: WaterPassageEnteredPayload | null = null
   private pendingLevelAdvanced: LevelAdvancedPayload | null = null
   private pendingRoomRestart: RoomRestartPayload | null = null
   private latestEnemyState: EnemyNetState[] | null = null
@@ -306,6 +316,7 @@ export class GameNetworkStore {
         this.teamStars = ack.teamStars ?? 0
         this.levelState = ack.levelState ?? null
         this.frogProgress = ack.frogProgress ?? null
+        this.waterLevelState = ack.waterLevelState ?? null
 
         this.notify()
         resolve(ack.room)
@@ -403,6 +414,23 @@ export class GameNetworkStore {
       this.teamStars = payload.teamStars
       this.epoch = payload.epoch
       this.pendingRoomRestart = payload
+      this.notify()
+    })
+    // Уровень 3 (кувшинки/ключ/проход) — см. комментарий у WaterSegmentState.
+    socket.on("waterItemCollected", (payload) => {
+      if (this.waterLevelState && this.waterLevelState.level === payload.level) {
+        this.waterLevelState = {
+          ...this.waterLevelState,
+          collectedItemIds: [...this.waterLevelState.collectedItemIds, payload.itemId],
+          keyFound: payload.keyFound,
+        }
+      }
+      this.waterItemCollectedQueue.push(payload)
+    })
+    socket.on("waterPassageEntered", (payload) => {
+      if (this.waterLevelState) this.waterLevelState = { ...this.waterLevelState, passageEntered: true }
+      this.levelState = payload.levelState
+      this.pendingWaterPassageEntered = payload
       this.notify()
     })
   }
@@ -642,9 +670,34 @@ export class GameNetworkStore {
 
     return new Promise((resolve) => {
       this.socket!.emit("ensureWaterSegment", { roomId: this.roomInfo!.roomId, level, width, height }, (ack: EnsureWaterSegmentAck) => {
+        if (ack.ok && ack.segment) this.waterLevelState = ack.segment
         resolve(ack.ok && ack.segment ? ack.segment : null)
       })
     })
+  }
+
+  /** Уровень 3 — актуальное общее состояние (кувшинки/ключ/проход), если
+   * комната до него уже добралась (свой собственный ensureWaterSegment/
+   * JoinRoomAck.waterLevelState) — null, если ещё нет. */
+  public getWaterLevelState(): WaterSegmentState | null {
+    return this.waterLevelState
+  }
+
+  /** Локальный игрок подобрал кувшинку/ключ на уровне 3 — навсегда для всей
+   * комнаты (тот же принцип, что и requestBoostActivate). В single player —
+   * no-op, вызывающий код применяет эффект локально сам. */
+  public requestWaterItemPickup(level: number, itemId: string, isKey: boolean): void {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return
+    this.socket.emit("waterItemPickup", { roomId: this.roomInfo.roomId, level, itemId, isKey })
+  }
+
+  /** Локальный игрок коснулся уже открытого прохода — просит сервер перевести
+   * ВСЮ комнату на уровень 4. Сам переход GameScene выполняет не отсюда, а из
+   * drainWaterPassageEntered() — широковещательно, тем же принципом, что и
+   * requestAdvanceLevel (событие приходит ОБОИМ клиентам, включая заявителя). */
+  public requestWaterPassageEnter(level: number, width: number, height: number): void {
+    if (this.mode !== "coop" || !this.socket || !this.roomInfo) return
+    this.socket.emit("waterPassageEnter", { roomId: this.roomInfo.roomId, level, width, height })
   }
 
   /** Игрок дошёл до двери с полным общим счётом звёзд — просит сервер
@@ -873,6 +926,18 @@ export class GameNetworkStore {
     return drained
   }
 
+  public drainWaterItemCollected(): WaterItemCollectedPayload[] {
+    const drained = this.waterItemCollectedQueue
+    this.waterItemCollectedQueue = []
+    return drained
+  }
+
+  public drainWaterPassageEntered(): WaterPassageEnteredPayload | null {
+    const drained = this.pendingWaterPassageEntered
+    this.pendingWaterPassageEntered = null
+    return drained
+  }
+
   public drainSlotUpdates(): SlotUpdatedPayload[] {
     const drained = this.slotUpdateQueue
     this.slotUpdateQueue = []
@@ -922,6 +987,9 @@ export class GameNetworkStore {
     this.teamStars = 0
     this.levelState = null
     this.frogProgress = null
+    this.waterLevelState = null
+    this.waterItemCollectedQueue = []
+    this.pendingWaterPassageEntered = null
     this.wallUpdateQueue = []
     this.starCollectedQueue = []
     this.lightUpdateQueue = []
