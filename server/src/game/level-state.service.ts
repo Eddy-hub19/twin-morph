@@ -133,17 +133,32 @@ export class LevelStateService {
     return true
   }
 
-  /** Засчитывает звезду в общий счёт команды — возвращает новый счёт, или
-   * null, если эта звезда (по id) уже была засчитана раньше (анти-даблпик). */
-  public collectStar(roomId: string, level: number, starId: string): number | null {
+  /** Засчитывает звезду в общий счёт команды. Различает ДВЕ разные причины
+   * отказа (см. StarPickupAck в shared/game-protocol.ts) — клиенту важно
+   * знать, какая именно: "stale-level" стоит откатить локальный
+   * оптимистичный подбор (комната уже ушла на другой уровень/эпоху, ответ
+   * запоздал), а "already-collected" — нет (звезду забрал напарник, она и
+   * так должна остаться скрытой, откатывать нечего, только подтянуть
+   * teamStars). */
+  public collectStar(
+    roomId: string,
+    level: number,
+    starId: string,
+  ): { ok: true; teamStars: number } | { ok: false; alreadyCollected: boolean; teamStars: number; reason: string } {
     const state = this.levelByRoom.get(roomId)
-    if (!state || state.level !== level) return null
-    if (state.collectedItemIds.includes(starId)) return null
+    const teamStars = this.teamStarsByRoom.get(roomId) ?? 0
+
+    if (!state || state.level !== level) {
+      return { ok: false, alreadyCollected: false, teamStars, reason: "stale-level" }
+    }
+    if (state.collectedItemIds.includes(starId)) {
+      return { ok: false, alreadyCollected: true, teamStars, reason: "already-collected" }
+    }
 
     state.collectedItemIds.push(starId)
-    const teamStars = (this.teamStarsByRoom.get(roomId) ?? 0) + 1
-    this.teamStarsByRoom.set(roomId, teamStars)
-    return teamStars
+    const nextTeamStars = teamStars + 1
+    this.teamStarsByRoom.set(roomId, nextTeamStars)
+    return { ok: true, teamStars: nextTeamStars }
   }
 
   /** Зажигает факел на весь уровень (для всей комнаты) — null, если уже

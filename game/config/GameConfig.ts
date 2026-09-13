@@ -428,3 +428,12 @@ export const PARTNER_ARROW_MARGIN = 30
 export const PARTNER_ARROW_TOP_MARGIN = 64 // ниже HUD-текста (счётчик звёзд/листьев)
 export const PARTNER_ARROW_SMOOTHING = 8
 export const PARTNER_ARROW_COLOR = 0xffe066
+
+/** Напарник (Worm/Ant/Frog, ведомый setRemotePosition) не телепортируется в
+ * присланную позицию напрямую, а плавно доводится до неё (доля пути за
+ * секунду, тот же принцип, что и у PARTNER_ARROW_SMOOTHING выше) — сама
+ * позиция-цель уже интерполирована между двумя снапшотами (см.
+ * GameNetworkStore.getRemotePlayerStates), так что в норме (частые снапшоты)
+ * это почти незаметно, но сглаживает именно тот самый видимый "прыжок" после
+ * просадки/обрыва связи, когда цель между кадрами вдруг сильно сдвигается. */
+export const REMOTE_PLAYER_SMOOTHING = 18

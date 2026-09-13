@@ -3,6 +3,13 @@ import { Entity } from "./Entity"
 import { STAR_SIZE } from "../config/GameConfig"
 
 export class Star extends Entity {
+  // Круг нарисован вокруг локального (0,0) (см. drawCircle ниже) — то есть
+  // container.x/y уже и так его ЦЕНТР, а не левый верхний угол. См.
+  // комментарий у Worm.originX/Y — тот же принцип, тут просто не спрайт, а
+  // Graphics.
+  protected override originX = 0.5
+  protected override originY = 0.5
+
   /** Стабильный id ("level:star:index") — одинаковый на обоих клиентах, раз
    * оба генерируют звёзды в одном и том же порядке из общего seed. По нему
    * сервер не даёт засчитать одну и ту же звезду дважды (см. GameScene). */

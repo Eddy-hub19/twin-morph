@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react"
 import { Engine } from "@/game/core/Engine"
 import type { InputManager } from "@/game/input/InputManager"
-import { useGameSocket } from "@/hooks/useGameSocket"
+import { useGameSocketActions } from "@/hooks/useGameSocket"
 
 import TouchControls from "./TouchControls"
 import PauseButton from "./PauseButton"
@@ -29,7 +29,12 @@ export default function Game({ onExitToMenu }: GameProps) {
   const engineRef = useRef<Engine | null>(null)
   const [input, setInput] = useState<InputManager | null>(null)
   const [paused, setPaused] = useState(false)
-  const { disconnect } = useGameSocket()
+  // useGameSocketActions — НЕ useGameSocket(): Game не читает ни один
+  // сетевой снапшот (mode/connectionStatus/room/...), ему нужен только
+  // disconnect() при выходе в меню, а useGameSocket() подписал бы этот
+  // компонент на useSyncExternalStore и заставил бы его ре-рендериться при
+  // каждом notify() стора (см. комментарий у useGameSocketActions).
+  const { disconnect } = useGameSocketActions()
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -38,12 +43,33 @@ export default function Game({ onExitToMenu }: GameProps) {
     // отработать, cancelled не даёт "ожить" уже ненужному Engine — вместо
     // этого он тут же уничтожается сразу по готовности (см. .then ниже).
     let cancelled = false
+    // true, как только initialize() реально резолвится — при обычном
+    // (не мгновенном) unmount к этому моменту Engine уже полностью собран
+    // (ticker/рендерер существуют), и cleanup ниже может звать destroy()
+    // прямо сейчас, синхронно, а не откладывать это до чужого .then().
+    let initialized = false
     const engine = new Engine(containerRef.current)
     engineRef.current = engine
 
+    // engine.destroy() сам по себе идемпотентен (Engine.destroy — no-op при
+    // повторном вызове), но destroyOnce всё равно нужен: без него первый же
+    // vs. второй путь (cleanup synchronously vs. .then() ниже) могли бы оба
+    // отработать по разу за один и тот же unmount (см. оба места вызова).
+    let destroyedOnce = false
+    const destroyOnce = () => {
+      if (destroyedOnce) return
+      destroyedOnce = true
+      engine.destroy()
+    }
+
     engine.initialize().then(() => {
+      initialized = true
+
       if (cancelled) {
-        engine.destroy()
+        // Unmount успел случиться, пока initialize() (async) ещё выполнялась
+        // — только сейчас Engine стал полностью собран (ticker/рендерер уже
+        // существуют), и только сейчас destroy() безопасен.
+        destroyOnce()
         return
       }
 
@@ -59,17 +85,24 @@ export default function Game({ onExitToMenu }: GameProps) {
     return () => {
       cancelled = true
       engineRef.current = null
-      // НЕ вызываем engine.destroy() прямо тут: initialize() (см. выше) —
-      // асинхронный (await app.init(), await AssetLoader.load()), и на
-      // момент немедленного unmount (например, React StrictMode в dev,
-      // синхронно размонтирующий сразу после монтирования) PIXI Application
-      // мог быть только что создан (this.app уже не null), но ещё не
-      // полностью инициализирован (ticker/рендерер ещё не существуют) —
-      // destroy() в этот момент падает на попытке снять несуществующий
-      // тикер. Настоящее уничтожение — исключительно в .then() выше, когда
-      // initialize() реально завершилась (и cancelled уже true, если мы
-      // сюда попали до этого) — то есть уничтожение просто откладывается до
-      // готовности, а не пропускается.
+
+      if (initialized) {
+        // Обычный случай: initialize() уже успела отработать к моменту
+        // unmount — уничтожаем Engine (ticker/InputManager/сцена/canvas)
+        // прямо тут. Раньше этот путь не был покрыт вообще: cancelled
+        // выставлялся, но ничего не вызывало destroy(), раз .then() выше уже
+        // успел отработать до unmount — Engine, его ticker и canvas просто
+        // оставались висеть в памяти навсегда при каждом обычном возврате в
+        // меню.
+        destroyOnce()
+      }
+      // Иначе initialize() всё ещё выполняется (например, React StrictMode
+      // в dev, синхронно размонтирующий сразу после монтирования, или очень
+      // быстрый выход прямо во время загрузки) — cancelled=true выше
+      // заставит .then() уничтожить Engine сразу по готовности, а не тут:
+      // на этот момент PIXI Application мог быть только что создан, но ещё
+      // не полностью инициализирован (ticker/рендерер ещё не существуют), и
+      // destroy() тут же упал бы на попытке снять несуществующий тикер.
     }
   }, [])
 

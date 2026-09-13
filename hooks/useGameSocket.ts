@@ -53,3 +53,29 @@ export function useGameSocket(): UseGameSocketResult {
     store,
   }
 }
+
+export interface UseGameSocketActions {
+  startSolo: (form?: PlayerForm) => void
+  startCoop: (roomId?: string) => Promise<RoomInfo>
+  disconnect: () => void
+  store: GameNetworkStore
+}
+
+/**
+ * Для потребителей, которым нужны только действия (disconnect/startSolo/
+ * startCoop), а не подписанный снапшот комнаты — например, Game.tsx: она
+ * зовёт disconnect() только один раз, при выходе в меню, и раньше ради этого
+ * держала полную useSyncExternalStore-подписку через useGameSocket() выше, из-
+ * за которой Pixi-игровой цикл вызывал notify() (см. GameNetworkStore.update)
+ * и заставлял React-компонент Game ре-рендериться на каждый кадр — 60 раз в
+ * секунду, хотя сам Game из снапшота ничего, кроме disconnect, не читает.
+ * store — стабильный singleton (GameNetworkStore.getInstance()), так что эти
+ * функции не меняются между рендерами без всякого useSyncExternalStore.
+ */
+export function useGameSocketActions(): UseGameSocketActions {
+  const startSolo = useCallback((form?: PlayerForm) => store.startSolo(form), [])
+  const startCoop = useCallback((roomId?: string) => store.startCoop(roomId), [])
+  const disconnect = useCallback(() => store.disconnect(), [])
+
+  return { startSolo, startCoop, disconnect, store }
+}

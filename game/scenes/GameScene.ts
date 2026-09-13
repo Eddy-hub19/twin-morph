@@ -1,7 +1,7 @@
 import { Scene } from "./Scene"
 import { Entity } from "../entities/Entity"
 import { Worm } from "../entities/Worm"
-import { Wall, findWallAt, isPointBlocked } from "../entities/Wall"
+import { Wall, findWallAt, isPointBlocked, type WallLookup } from "../entities/Wall"
 import { Star } from "../entities/Star"
 import { Bubble } from "../entities/Bubble"
 import { SpeedBubble } from "../entities/SpeedBubble"
@@ -101,6 +101,72 @@ enum MetaState {
 
 export class GameScene extends Scene {
   private entities: Entity[] = []
+
+  // -------------------------------------------------------------------------
+  // Perf (hotfix/gameplay-performance): раньше update() каждый кадр заново
+  // проходил ВЕСЬ this.entities (на уровне копания это могут быть сотни
+  // стен) через .filter()/.find() по instanceof, чтобы достать нужные
+  // подмножества — стены, звёзды, пузырьки, врагов и т.д. Теперь addEntity()/
+  // removeEntity() сразу раскладывают сущность по нужным индексам (см.
+  // indexEntity/unindexEntity ниже), а update() их просто читает — без
+  // единого прохода по всему списку сущностей за кадр.
+  // -------------------------------------------------------------------------
+  private walls: Wall[] = []
+  /** По networking cellKey (см. Wall.cellKey, только levels 0/1) — служит и
+   * для применения чужих ударов (wallUpdated/applyLevelDiff), и как O(1)
+   * пространственный индекс "какая стена под этой точкой" (см. wallLookup/
+   * cellKeyFor ниже — тот же формат ключа, каким стена регистрирует себя
+   * при создании в generateNextLevel). */
+  private readonly wallByCellKey = new Map<string, Wall>()
+  /** Стены, ударенные в этом кадре (см. Wall.onDirty, выставляется прямо из
+   * Wall.hit()) — раз в кадр вычерпывается для репорта в сеть (см. update()),
+   * вместо сканирования всех this.walls в поисках justHit. */
+  private readonly dirtyWalls = new Set<Wall>()
+  private stars: Star[] = []
+  private readonly starsById = new Map<string, Star>()
+  private bubbles: Bubble[] = []
+  private readonly bubblesById = new Map<string, Bubble>()
+  private speedBubbles: SpeedBubble[] = []
+  private readonly speedBubblesById = new Map<string, SpeedBubble>()
+  private revealSwitches: RevealSwitch[] = []
+  private readonly revealSwitchesById = new Map<string, RevealSwitch>()
+  private guards: GuardWorm[] = []
+  private enemies: EnemyWorm[] = []
+  private materials: Material[] = []
+  private readonly materialsById = new Map<string, Material>()
+  private bridgeSlots: BridgeSlot[] = []
+  private readonly bridgeSlotsById = new Map<string, BridgeSlot>()
+  private bigBranch: BigBranch | null = null
+  private nest: Nest | null = null
+  /** Чекпоинт/пруд уровня 3 (индекс 2) — по одному на сегмент, читаются
+   * каждый кадр для муравья (см. update()), та же логика кэширования, что и
+   * у bigBranch/nest выше. */
+  private checkpoint: Checkpoint | null = null
+  private pond: Pond | null = null
+  /** Кнопка(и) сохранения — обычно одна на сегмент, но массив (а не
+   * singleton, как у checkpoint/pond выше), т.к. на стыке уровней старая
+   * ещё может на мгновение сосуществовать с новой (см. комментарий у
+   * оригинального entities.filter(SaveButton) — тот же принцип). */
+  private saveButtons: SaveButton[] = []
+  /** Сущности, которым реально нужен update() каждый кадр — то есть НЕ
+   * статичные декорации/предметы (у Wall/Star/Bubble/SpeedBubble/
+   * RevealSwitch/BridgeSlot/Material/Nest/SaveButton/LevelDoorMarker/Sky/
+   * Water/Pond/BigBranch update() всегда пуст, см. соответствующие классы):
+   * вражеские черви, страж и сами игроки (активный + напарники — из них
+   * реально обновляется только активный, остальные тут просто пропускаются
+   * по ссылке, но это уже проверка на маленьком списке в несколько
+   * элементов, а не проход по всем стенам/звёздам уровня). */
+  private dynamicEntities: Entity[] = []
+  /** O(1)-поиск стены "под точкой" для Worm/EnemyWorm/GuardWorm (см.
+   * entities/Wall.ts:WallLookup) — тот же wallByCellKey выше, обёрнутый под
+   * их интерфейс. Строится один раз (замыкание над this), а не заново
+   * каждый кадр. */
+  private readonly wallLookup: WallLookup = {
+    get: (x, y) => {
+      const wall = this.wallByCellKey.get(this.cellKeyFor(x, y))
+      return wall && wall.container.visible ? wall : undefined
+    },
+  }
 
   private activePlayer!: any
   private deathTimer = 0
@@ -322,6 +388,12 @@ export class GameScene extends Scene {
   // applyEnemyNetStates) — сам гость эту логику не считает.
   private readonly lastCarriedStarByEnemy = new Map<string, string | null>()
 
+  /** starId, для которых наш собственный запрос на подбор уже в полёте (см.
+   * tryPickupStar) — не даёт слать повторный starPickup КАЖДЫЙ кадр, пока
+   * игрок продолжает касаться звезды, а ответ ещё не пришёл. Всегда пуст в
+   * solo (там подбор мгновенный, локальный, без сети). */
+  private readonly pendingStarPickups = new Set<string>()
+
   // Загружаем сохранённый уровень только один раз — при самом первом
   // onCreate() (настоящая загрузка страницы). Рестарт после смерти вызывает
   // onCreate() повторно на том же экземпляре сцены и должен по-прежнему
@@ -356,6 +428,11 @@ export class GameScene extends Scene {
     this.pendingLevel4State = null
     this.pendingWormInit = false
     this.lastCarriedStarByEnemy.clear()
+    // Рестарт/reconnect — все запросы, отправленные ДО этого момента,
+    // относятся к уже неактуальному уровню/эпохе; их ack (если ещё придёт)
+    // будет отброшен в tryPickupStar по несовпадению levelIndex/roomEpoch,
+    // но сам факт "в полёте" тут ничего больше не должен блокировать.
+    this.pendingStarPickups.clear()
     // Текст факела-выключателя переживал рестарт уровня: revealTimer тут
     // выше уже честно обнулён, но сам HUD-текст (тот же Text-объект, что и
     // до смерти) оставался видимым с застрявшим числом — updateReveal()
@@ -709,20 +786,13 @@ export class GameScene extends Scene {
    * levelAdvanced.
    */
   private applyLevelDiff(levelState: RoomLevelState): void {
-    const walls = this.entities.filter((e): e is Wall => e instanceof Wall)
     for (const [cellKey, hits] of Object.entries(levelState.wallHits)) {
-      walls.find((w) => w.cellKey === cellKey)?.applyRemoteHits(hits)
+      this.wallByCellKey.get(cellKey)?.applyRemoteHits(hits)
     }
 
-    if (levelState.collectedItemIds.length > 0) {
-      const collectibles = this.entities.filter(
-        (e): e is Star | Bubble | SpeedBubble | RevealSwitch =>
-          e instanceof Star || e instanceof Bubble || e instanceof SpeedBubble || e instanceof RevealSwitch,
-      )
-      for (const id of levelState.collectedItemIds) {
-        const item = collectibles.find((e) => e.id === id)
-        if (item) item.container.visible = false
-      }
+    for (const id of levelState.collectedItemIds) {
+      const item = this.starsById.get(id) ?? this.bubblesById.get(id) ?? this.speedBubblesById.get(id) ?? this.revealSwitchesById.get(id)
+      if (item) item.container.visible = false
     }
 
     // Это догоняющий снапшот при входе/реконнекте, а не живой подбор пузырька
@@ -754,11 +824,10 @@ export class GameScene extends Scene {
   /** Часть applyLevelDiff, специфичная для уровня 3 (индекс 2, пруд/мост) —
    * см. комментарий у RoomLevelState.materialCarriers/bridgeSlots/bigBranch. */
   private applyPondLevelDiff(levelState: RoomLevelState): void {
-    const materials = this.entities.filter((e): e is Material => e instanceof Material)
     const localPlayerId = this.network.getSnapshot().localPlayerId
 
     for (const [materialId, carrierId] of Object.entries(levelState.materialCarriers)) {
-      const material = materials.find((m) => m.id === materialId)
+      const material = this.materialsById.get(materialId)
       if (material) material.container.visible = false
 
       if (carrierId === localPlayerId) {
@@ -768,17 +837,16 @@ export class GameScene extends Scene {
       }
     }
 
-    const slots = this.entities.filter((e): e is BridgeSlot => e instanceof BridgeSlot)
     for (const [slotId, materialId] of Object.entries(levelState.bridgeSlots)) {
-      const slot = slots.find((s) => s.id === slotId)
-      const material = materials.find((m) => m.id === materialId)
+      const slot = this.bridgeSlotsById.get(slotId)
+      const material = this.materialsById.get(materialId)
       if (slot && material && !slot.isInstalled) {
         slot.install(materialId, material.kind)
         material.container.visible = false
       }
     }
 
-    const bigBranch = this.entities.find((e): e is BigBranch => e instanceof BigBranch)
+    const bigBranch = this.bigBranch
     if (bigBranch) {
       // Хост сам продолжает считать прогресс локально (tick() в update()) —
       // навязывать ему setRemoteState нельзя, иначе он навсегда станет
@@ -789,10 +857,112 @@ export class GameScene extends Scene {
 
       if (levelState.bigBranch.progress >= 1 && !bigBranch.installed) {
         bigBranch.markInstalled()
-        const finalSlot = slots[slots.length - 1]
+        const finalSlot = this.bridgeSlots[this.bridgeSlots.length - 1]
         if (finalSlot && !finalSlot.isInstalled) finalSlot.install("bigBranch", "bigBranch")
       }
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Уровни 0/1 (копание) — подбор звезды. Раньше эту логику вели Worm/Ant
+  // прямо у себя в update() (сразу прятали звезду при столкновении), а
+  // GameScene лишь ЗАМЕЧАЛ факт по diff'у видимости (starsVisibleBefore,
+  // пересоздаваемому Map'ом каждый кадр) — единственная точка подбора теперь
+  // тут, вызывается из update() при столкновении активного игрока со звездой.
+  // -------------------------------------------------------------------------
+
+  /**
+   * true, если пройденный за этот кадр отрезок (prevX, prevY) -> текущая
+   * позиция активного игрока прошёл достаточно близко к звезде, чтобы
+   * засчитать касание — не только "звезда содержит конечную точку", как у
+   * обычного isColliding(). Без этого при просадке кадра (см. комментарий у
+   * вызова) игрок мог целиком перепрыгнуть маленький хитбокс звезды за один
+   * шаг update(), ни разу не пересекшись с ней в итоговой позиции.
+   * "Радиус" игрока тут — грубая оценка (половина меньшей стороны его
+   * рамки), а не точный AABB, но для маленькой круглой звезды этого более
+   * чем достаточно и намного дешевле честного отрезок-против-прямоугольника.
+   */
+  private isPlayerPathNearStar(prevX: number, prevY: number, star: Star): boolean {
+    const player = this.activePlayer
+    const curX = player.container.x
+    const curY = player.container.y
+
+    const dx = curX - prevX
+    const dy = curY - prevY
+    const lengthSq = dx * dx + dy * dy
+
+    // t — проекция звезды на отрезок движения, зажатая в [0, 1] (0 — старт
+    // кадра, 1 — конец); при lengthSq === 0 игрок не двигался вовсе, и
+    // ближайшая точка отрезка — просто его единственная точка.
+    const t = lengthSq > 0 ? Math.max(0, Math.min(1, ((star.container.x - prevX) * dx + (star.container.y - prevY) * dy) / lengthSq)) : 0
+
+    const closestX = prevX + t * dx
+    const closestY = prevY + t * dy
+
+    const playerRadius = Math.min(player.width, player.height) / 2
+    const hitRadius = star.width / 2 + playerRadius
+
+    return Math.hypot(star.container.x - closestX, star.container.y - closestY) <= hitRadius
+  }
+
+  /**
+   * В single player сразу и без сети засчитывает звезду. В co-op прячет её
+   * ОПТИМИСТИЧНО (не дожидаясь ответа) и просит сервер подтвердить — если
+   * он говорит "уже забрали" (alreadyCollected), оставляем скрытой и просто
+   * подтягиваем актуальный общий счёт; если ack не пришёл вовсе (таймаут)
+   * или сообщает про устаревший level/эпоху — откатываем звезду обратно
+   * видимой, раз сервер её подбор не подтвердил. pendingStarPickups не даёт
+   * слать повторный запрос на КАЖДОМ кадре, пока ответ ещё не пришёл, а
+   * игрок продолжает стоять на звезде.
+   */
+  private tryPickupStar(star: Star): void {
+    if (!star.container.visible || this.pendingStarPickups.has(star.id)) return
+
+    if (this.network.getSnapshot().mode !== "coop") {
+      star.container.visible = false
+      this.collectedStars += 1
+      if (this.activePlayer instanceof Ant) this.activePlayer.showLeafPickupEffect()
+      this.updateHud()
+      return
+    }
+
+    const level = this.levelIndex
+    const epoch = this.roomEpoch
+
+    this.pendingStarPickups.add(star.id)
+    star.container.visible = false
+    if (this.activePlayer instanceof Ant) this.activePlayer.showLeafPickupEffect()
+
+    this.network.requestStarPickup(level, star.id).then((ack) => {
+      this.pendingStarPickups.delete(star.id)
+
+      if (ack.ok) {
+        // Общий счёт/HUD обновит широковещательный starCollected (см.
+        // processSharedLevelEvents/drainStarCollected) — он приходит и
+        // самому отправителю, не только напарнику, так что тут больше
+        // ничего делать не нужно.
+        return
+      }
+
+      if (ack.alreadyCollected) {
+        // Напарник забрал её первым — звезда и так уже скрыта (мы сами
+        // спрятали её оптимистично выше), просто подстраховываем общий
+        // счёт на случай, если широковещательный starCollected от напарника
+        // почему-то ещё не дошёл.
+        if (typeof ack.teamStars === "number") this.network.reconcileTeamStars(ack.teamStars)
+        return
+      }
+
+      // Таймаут или устаревший level/epoch (например, комната успела
+      // перезапуститься/перейти дальше, пока ответ шёл) — откатываем
+      // локальный оптимистичный подбор, раз сервер его не подтвердил. Только
+      // если мы всё ещё на том же уровне/эпохе — иначе эта Star могла уже
+      // быть удалена из мира вовсе (см. clearEntityIndices), возвращать её
+      // видимой незачем и может быть небезопасно.
+      if (this.levelIndex === level && this.roomEpoch === epoch) {
+        star.container.visible = true
+      }
+    })
   }
 
   // -------------------------------------------------------------------------
@@ -818,7 +988,7 @@ export class GameScene extends Scene {
   /** Применяет "материал подобран" — и для своего клейма (isLocal), и для
    * чужого (просто прячет материал, ничего в своём состоянии не меняет). */
   private applyMaterialGrabbed(materialId: string, isLocal: boolean): void {
-    const material = this.entities.find((e): e is Material => e instanceof Material && e.id === materialId)
+    const material = this.materialsById.get(materialId)
     if (!material || !material.container.visible) return // уже подобран/установлен кем-то
 
     material.container.visible = false
@@ -834,7 +1004,7 @@ export class GameScene extends Scene {
   /** Материал снова свободен (утонул носитель) — возвращаем его видимым на
    * то же (исходное) место, координаты никогда не менялись. */
   private applyMaterialReleased(materialId: string): void {
-    const material = this.entities.find((e): e is Material => e instanceof Material && e.id === materialId)
+    const material = this.materialsById.get(materialId)
     if (material) material.container.visible = true
   }
 
@@ -873,8 +1043,8 @@ export class GameScene extends Scene {
   /** Окончательно ставит материал в слот — необратимо, освобождает носителя
    * (если это были мы). */
   private applyMaterialInstalled(materialId: string, slotId: string): void {
-    const slot = this.entities.find((e): e is BridgeSlot => e instanceof BridgeSlot && e.id === slotId)
-    const material = this.entities.find((e): e is Material => e instanceof Material && e.id === materialId)
+    const slot = this.bridgeSlotsById.get(slotId)
+    const material = this.materialsById.get(materialId)
     if (!slot || !material || slot.isInstalled) return
 
     slot.install(materialId, material.kind)
@@ -904,6 +1074,7 @@ export class GameScene extends Scene {
     if (dead) {
       this.worldContainer.removeChild(dead.container)
       this.entities = this.entities.filter((e) => e !== dead)
+      this.unindexEntity(dead)
     }
 
     const ant = new Ant(this.input, this.lastCheckpointX, this.lastCheckpointY)
@@ -921,30 +1092,26 @@ export class GameScene extends Scene {
   /** Гость применяет состояние врагов, присланное хостом — вместо своего ИИ
    * (см. EnemyWorm.setRemoteState/GuardWorm.setRemoteState). */
   private applyEnemyNetStates(states: EnemyNetState[]): void {
-    const enemies = this.entities.filter((e): e is EnemyWorm => e instanceof EnemyWorm)
-    const guards = this.entities.filter((e): e is GuardWorm => e instanceof GuardWorm)
-    const stars = this.entities.filter((e): e is Star => e instanceof Star)
-
     for (const state of states) {
       if (state.kind === "guard") {
-        guards.find((g) => g.remoteId === state.id)?.setRemoteState(state)
+        this.guards.find((g) => g.remoteId === state.id)?.setRemoteState(state)
         continue
       }
 
-      enemies.find((e) => e.remoteId === state.id)?.setRemoteState(state)
+      this.enemies.find((e) => e.remoteId === state.id)?.setRemoteState(state)
 
       const prevCarried = this.lastCarriedStarByEnemy.get(state.id) ?? null
       this.lastCarriedStarByEnemy.set(state.id, state.carryingStarId)
 
       if (state.carryingStarId) {
-        const star = stars.find((s) => s.id === state.carryingStarId)
+        const star = this.starsById.get(state.carryingStarId)
         if (star) star.container.visible = false
       } else if (prevCarried) {
         // Только что перестал нести (подобрали обратно/донёс до домика на
         // стороне хоста) — показываем звезду снова у текущей позиции врага:
         // для доставки в домик это и есть фактическое место, для отбитой у
         // вора звезды — очень близко к месту падения.
-        const star = stars.find((s) => s.id === prevCarried)
+        const star = this.starsById.get(prevCarried)
         if (star) {
           star.container.position.set(state.x, state.y)
           star.container.visible = true
@@ -975,8 +1142,13 @@ export class GameScene extends Scene {
 
     // Тот же приём, что и в исходном локальном переходе: оставляем только
     // активного игрока и напарника, остальное (стены/предметы старого
-    // уровня) регенерируется заново из нового seed.
-    this.entities = this.entities.filter((entity) => entity === this.activePlayer || this.isRemoteEntity(entity))
+    // уровня) регенерируется заново из нового seed. Полный сброс индексов +
+    // переиндексация оставшихся (их всего 1-2) дешевле и надёжнее, чем
+    // выборочно вычищать из каждого кэша по одной удалённой сущности.
+    const kept = this.entities.filter((entity) => entity === this.activePlayer || this.isRemoteEntity(entity))
+    this.clearEntityIndices()
+    this.entities = kept
+    for (const entity of kept) this.indexEntity(entity)
     this.worldContainer.removeChildren()
     if (this.activePlayer) this.worldContainer.addChild(this.activePlayer.container)
     for (const remote of this.remoteEntities.values()) this.worldContainer.addChild(remote.entity.container)
@@ -1029,21 +1201,17 @@ export class GameScene extends Scene {
     const level = this.levelIndex
 
     const wallUpdates = this.network.drainWallUpdates()
-    if (wallUpdates.length > 0) {
-      const walls = this.entities.filter((e): e is Wall => e instanceof Wall)
-      for (const update of wallUpdates) {
-        if (update.level !== level || update.epoch !== epoch) continue
-        walls.find((w) => w.cellKey === update.cellKey)?.applyRemoteHits(update.hits)
-      }
+    for (const update of wallUpdates) {
+      if (update.level !== level || update.epoch !== epoch) continue
+      this.wallByCellKey.get(update.cellKey)?.applyRemoteHits(update.hits)
     }
 
     const starUpdates = this.network.drainStarCollected()
     if (starUpdates.length > 0) {
-      const stars = this.entities.filter((e): e is Star => e instanceof Star)
       let anyApplied = false
       for (const update of starUpdates) {
         if (update.level !== level || update.epoch !== epoch) continue
-        const star = stars.find((s) => s.id === update.starId)
+        const star = this.starsById.get(update.starId)
         if (star) star.container.visible = false
         anyApplied = true
       }
@@ -1051,38 +1219,31 @@ export class GameScene extends Scene {
     }
 
     const lightUpdates = this.network.drainLightUpdates()
-    if (lightUpdates.length > 0) {
-      const switches = this.entities.filter((e): e is RevealSwitch => e instanceof RevealSwitch)
-      for (const update of lightUpdates) {
-        if (update.level !== level || update.epoch !== epoch) continue
-        const revealSwitch = switches.find((s) => s.id === update.switchId)
-        if (revealSwitch) revealSwitch.container.visible = false
-        this.revealTimer = Math.max(0, (update.lightEndsAt - Date.now()) / 1000)
-        if (this.revealText) {
-          this.revealText.visible = this.revealTimer > 0
-          this.revealText.text = `🔥 Карта видна: ${Math.ceil(this.revealTimer)}с`
-        }
+    for (const update of lightUpdates) {
+      if (update.level !== level || update.epoch !== epoch) continue
+      const revealSwitch = this.revealSwitchesById.get(update.switchId)
+      if (revealSwitch) revealSwitch.container.visible = false
+      this.revealTimer = Math.max(0, (update.lightEndsAt - Date.now()) / 1000)
+      if (this.revealText) {
+        this.revealText.visible = this.revealTimer > 0
+        this.revealText.text = `🔥 Карта видна: ${Math.ceil(this.revealTimer)}с`
       }
     }
 
     const boostUpdates = this.network.drainBoostUpdates()
-    if (boostUpdates.length > 0) {
-      const bubbles = this.entities.filter((e): e is Bubble => e instanceof Bubble)
-      const speedBubbles = this.entities.filter((e): e is SpeedBubble => e instanceof SpeedBubble)
-      for (const update of boostUpdates) {
-        if (update.level !== level || update.epoch !== epoch) continue
+    for (const update of boostUpdates) {
+      if (update.level !== level || update.epoch !== epoch) continue
 
-        if (update.kind === "light") {
-          const bubble = bubbles.find((b) => b.id === update.bubbleId)
-          if (bubble) bubble.container.visible = false
-          // Сдвигаем только цель — сам lightRadius плавно доедет до неё в
-          // updateLightRadius, без синхронной перестройки текстуры тумана тут же.
-          this.targetLightRadius = this.baseLightRadius + update.lightRadiusBonus
-        } else {
-          const speedBubble = speedBubbles.find((b) => b.id === update.bubbleId)
-          if (speedBubble) speedBubble.container.visible = false
-          this.speedBoostTimer = Math.max(0, (update.speedBoostEndsAt - Date.now()) / 1000)
-        }
+      if (update.kind === "light") {
+        const bubble = this.bubblesById.get(update.bubbleId)
+        if (bubble) bubble.container.visible = false
+        // Сдвигаем только цель — сам lightRadius плавно доедет до неё в
+        // updateLightRadius, без синхронной перестройки текстуры тумана тут же.
+        this.targetLightRadius = this.baseLightRadius + update.lightRadiusBonus
+      } else {
+        const speedBubble = this.speedBubblesById.get(update.bubbleId)
+        if (speedBubble) speedBubble.container.visible = false
+        this.speedBoostTimer = Math.max(0, (update.speedBoostEndsAt - Date.now()) / 1000)
       }
     }
 
@@ -1105,7 +1266,7 @@ export class GameScene extends Scene {
     }
 
     if (level === 2) {
-      const bigBranch = this.entities.find((e): e is BigBranch => e instanceof BigBranch)
+      const bigBranch = this.bigBranch
       if (bigBranch && !this.network.isHost()) {
         const latestBigBranch = this.network.getLatestBigBranchState()
         if (latestBigBranch && latestBigBranch.level === level && latestBigBranch.epoch === epoch) {
@@ -1119,7 +1280,7 @@ export class GameScene extends Scene {
       // сторонах (BridgeSlot.install уже сам себя не даёт вызвать дважды).
       if (bigBranch && bigBranch.progress >= 1 && !bigBranch.installed) {
         bigBranch.markInstalled()
-        const finalSlot = this.entities.filter((e): e is BridgeSlot => e instanceof BridgeSlot).find((slot) => slot.accepts === "bigBranch")
+        const finalSlot = this.bridgeSlots.find((slot) => slot.accepts === "bigBranch")
         if (finalSlot && !finalSlot.isInstalled) finalSlot.install("bigBranch", "bigBranch")
       }
     }
@@ -1140,13 +1301,10 @@ export class GameScene extends Scene {
       // ТЕКУЩИХ (уже отрисованных) позиций — сущности те же самые, что были
       // спавнены изначально из общего seed, никто не пересоздаётся и не
       // дублируется, просто раньше молчавший puppet-режим выключается.
-      const enemies = this.entities.filter((e): e is EnemyWorm => e instanceof EnemyWorm)
-      const guards = this.entities.filter((e): e is GuardWorm => e instanceof GuardWorm)
-      for (const enemy of enemies) enemy.resumeLocalControl()
-      for (const guard of guards) guard.resumeLocalControl()
+      for (const enemy of this.enemies) enemy.resumeLocalControl()
+      for (const guard of this.guards) guard.resumeLocalControl()
 
-      const bigBranch = this.entities.find((e): e is BigBranch => e instanceof BigBranch)
-      bigBranch?.resumeLocalControl()
+      this.bigBranch?.resumeLocalControl()
     }
 
     this.wasHost = isHostNow
@@ -1589,14 +1747,14 @@ export class GameScene extends Scene {
     const starLocalYMax = level === 1 ? height - this.cellSize * 3 : height - 120
     const starLocalYRange = Math.max(starLocalYMax - starLocalYMin, 1)
 
-    // levelWalls нужен уже здесь (не только ниже для норы/врагов) — звёзды/
-    // пузырьки/факел лежат буквально закопанными в грунт (это нормально, их
-    // и предстоит откопать), но НЕ должны попасть в камень или бедрок: камень
-    // убивает при касании, а бедрок вообще не прогрызается — предмет там
-    // либо недостижим, либо достаётся только ценой смерти.
-    const levelWalls = this.entities.filter((e): e is Wall => e instanceof Wall)
+    // this.wallLookup уже видит все стены, добавленные ВЫШЕ в этом же вызове
+    // generateNextLevel (indexEntity индексирует их сразу в addEntity) —
+    // звёзды/пузырьки/факел лежат буквально закопанными в грунт (это
+    // нормально, их и предстоит откопать), но НЕ должны попасть в камень или
+    // бедрок: камень убивает при касании, а бедрок вообще не прогрызается —
+    // предмет там либо недостижим, либо достаётся только ценой смерти.
     const isInsideImpassableWall = (x: number, y: number): boolean => {
-      const type = findWallAt(levelWalls, x, y)?.type
+      const type = findWallAt(this.wallLookup, x, y)?.type
       return type === "stone" || type === "bedrock"
     }
     const findSafeItemSpot = (): { x: number; y: number } => {
@@ -1667,7 +1825,7 @@ export class GameScene extends Scene {
       let y = startY + localYMin + this.rng() * range
 
       for (let attempt = 0; attempt < FIND_OPEN_SPOT_MAX_ATTEMPTS; attempt++) {
-        if (!isPointBlocked(levelWalls, x, y)) break
+        if (!isPointBlocked(this.wallLookup, x, y)) break
         x = startX + this.rng() * (width - 100) + 50
         y = startY + localYMin + this.rng() * range
       }
@@ -1704,7 +1862,7 @@ export class GameScene extends Scene {
 
       let spot = sample()
       for (let attempt = 0; attempt < FIND_OPEN_SPOT_MAX_ATTEMPTS; attempt++) {
-        if (!isPointBlocked(levelWalls, spot.x, spot.y)) break
+        if (!isPointBlocked(this.wallLookup, spot.x, spot.y)) break
         spot = sample()
       }
 
@@ -1732,6 +1890,214 @@ export class GameScene extends Scene {
   private addEntity(entity: Entity): void {
     this.entities.push(entity)
     this.worldContainer.addChild(entity.container)
+    this.indexEntity(entity)
+  }
+
+  /** Восстанавливает networking cellKey ("${level}:${x}:${y}") клетки, в
+   * которую попадает мировая точка (x, y) — та же сетка (currentLevelXOffset/
+   * YOffset, шаг cellSize), которой generateNextLevel помечает сами стены
+   * при создании (см. cellKey там), поэтому даёт тот же ключ, под которым
+   * стена уже лежит в wallByCellKey. Точка всегда попадает ровно в одну
+   * клетку (полуоткрытый интервал, как и у прежнего геометрического
+   * findWallAt). Актуально только для levels 0/1 — единственных, где вообще
+   * проверяются столкновения со стенами (см. generateNextLevel: level > 1
+   * выходит до спавна врагов/стража, которым и нужен этот поиск). */
+  private cellKeyFor(x: number, y: number): string {
+    const gx = this.currentLevelXOffset + Math.floor((x - this.currentLevelXOffset) / this.cellSize) * this.cellSize
+    const gy = this.currentLevelYOffset + Math.floor((y - this.currentLevelYOffset) / this.cellSize) * this.cellSize
+    return `${this.levelIndex}:${gx}:${gy}`
+  }
+
+  /** Раскладывает только что добавленную сущность по нужным кэшам (см.
+   * комментарий у walls/stars/... в начале класса) — вызывается ИЗ
+   * addEntity(), сама this.entities не трогает. Симметрична unindexEntity
+   * ниже. */
+  private indexEntity(entity: Entity): void {
+    if (entity instanceof Wall) {
+      this.walls.push(entity)
+      if (entity.cellKey) {
+        this.wallByCellKey.set(entity.cellKey, entity)
+        entity.onDirty = (wall) => this.dirtyWalls.add(wall)
+      }
+      return
+    }
+    // SpeedBubble ПЕРЕД Bubble — независимые классы (обе extends Entity
+    // напрямую), порядок тут не для instanceof-иерархии, а просто чтобы не
+    // читать больше одного if.
+    if (entity instanceof SpeedBubble) {
+      this.speedBubbles.push(entity)
+      this.speedBubblesById.set(entity.id, entity)
+      return
+    }
+    if (entity instanceof Bubble) {
+      this.bubbles.push(entity)
+      this.bubblesById.set(entity.id, entity)
+      return
+    }
+    if (entity instanceof Star) {
+      this.stars.push(entity)
+      this.starsById.set(entity.id, entity)
+      return
+    }
+    if (entity instanceof RevealSwitch) {
+      this.revealSwitches.push(entity)
+      this.revealSwitchesById.set(entity.id, entity)
+      return
+    }
+    if (entity instanceof BridgeSlot) {
+      this.bridgeSlots.push(entity)
+      this.bridgeSlotsById.set(entity.id, entity)
+      return
+    }
+    if (entity instanceof Material) {
+      this.materials.push(entity)
+      this.materialsById.set(entity.id, entity)
+      return
+    }
+    if (entity instanceof GuardWorm) {
+      this.guards.push(entity)
+      this.dynamicEntities.push(entity)
+      return
+    }
+    if (entity instanceof EnemyWorm) {
+      this.enemies.push(entity)
+      this.dynamicEntities.push(entity)
+      return
+    }
+    if (entity instanceof BigBranch) {
+      this.bigBranch = entity
+      return
+    }
+    if (entity instanceof Nest) {
+      this.nest = entity
+      return
+    }
+    if (entity instanceof Checkpoint) {
+      this.checkpoint = entity
+      return
+    }
+    if (entity instanceof Pond) {
+      this.pond = entity
+      return
+    }
+    if (entity instanceof SaveButton) {
+      this.saveButtons.push(entity)
+      return
+    }
+    // Остальное — статичные декорации без индекса (Sky/Water/
+    // LevelDoorMarker, update() у всех пуст) или сами игроки (Worm/Ant/Frog,
+    // включая напарника) — им нужен update() каждый кадр (активному —
+    // напрямую, напарнику формально тоже, но forEach ниже сам пропускает
+    // его через isRemoteEntity).
+    if (entity instanceof Worm || entity instanceof Ant || entity instanceof Frog) {
+      this.dynamicEntities.push(entity)
+    }
+  }
+
+  /** Убирает сущность из всех кэшей, в которые её положил indexEntity() —
+   * вызывать ПЕРЕД тем, как выкинуть entity из this.entities (см. все места
+   * "entities = entities.filter(...)" ниже). Без этого удалённые стены/
+   * звёзды и т.п. продолжали бы висеть в кэшах/wallByCellKey вечно — самой
+   * очевидной утечкой памяти (PIXI-текстуры не собрались бы GC), даже если
+   * из основного массива entities их уже убрали. */
+  private unindexEntity(entity: Entity): void {
+    if (entity instanceof Wall) {
+      removeFromArray(this.walls, entity)
+      if (entity.cellKey && this.wallByCellKey.get(entity.cellKey) === entity) this.wallByCellKey.delete(entity.cellKey)
+      this.dirtyWalls.delete(entity)
+      return
+    }
+    if (entity instanceof SpeedBubble) {
+      removeFromArray(this.speedBubbles, entity)
+      this.speedBubblesById.delete(entity.id)
+      return
+    }
+    if (entity instanceof Bubble) {
+      removeFromArray(this.bubbles, entity)
+      this.bubblesById.delete(entity.id)
+      return
+    }
+    if (entity instanceof Star) {
+      removeFromArray(this.stars, entity)
+      this.starsById.delete(entity.id)
+      return
+    }
+    if (entity instanceof RevealSwitch) {
+      removeFromArray(this.revealSwitches, entity)
+      this.revealSwitchesById.delete(entity.id)
+      return
+    }
+    if (entity instanceof BridgeSlot) {
+      removeFromArray(this.bridgeSlots, entity)
+      this.bridgeSlotsById.delete(entity.id)
+      return
+    }
+    if (entity instanceof Material) {
+      removeFromArray(this.materials, entity)
+      this.materialsById.delete(entity.id)
+      return
+    }
+    if (entity instanceof GuardWorm) {
+      removeFromArray(this.guards, entity)
+      removeFromArray(this.dynamicEntities, entity)
+      return
+    }
+    if (entity instanceof EnemyWorm) {
+      removeFromArray(this.enemies, entity)
+      removeFromArray(this.dynamicEntities, entity)
+      return
+    }
+    if (entity instanceof BigBranch) {
+      if (this.bigBranch === entity) this.bigBranch = null
+      return
+    }
+    if (entity instanceof Nest) {
+      if (this.nest === entity) this.nest = null
+      return
+    }
+    if (entity instanceof Checkpoint) {
+      if (this.checkpoint === entity) this.checkpoint = null
+      return
+    }
+    if (entity instanceof Pond) {
+      if (this.pond === entity) this.pond = null
+      return
+    }
+    if (entity instanceof SaveButton) {
+      removeFromArray(this.saveButtons, entity)
+      return
+    }
+    removeFromArray(this.dynamicEntities, entity)
+  }
+
+  /** Полный сброс всех кэшей — рестарт уровня/комнаты (см. restartLevel) и
+   * широковещательный переход уровня (см. applyLevelAdvanced), где старое
+   * содержимое this.entities выбрасывается целиком (или почти целиком) одним
+   * махом, а не поштучно через unindexEntity. */
+  private clearEntityIndices(): void {
+    this.walls = []
+    this.wallByCellKey.clear()
+    this.dirtyWalls.clear()
+    this.stars = []
+    this.starsById.clear()
+    this.bubbles = []
+    this.bubblesById.clear()
+    this.speedBubbles = []
+    this.speedBubblesById.clear()
+    this.revealSwitches = []
+    this.revealSwitchesById.clear()
+    this.guards = []
+    this.enemies = []
+    this.materials = []
+    this.materialsById.clear()
+    this.bridgeSlots = []
+    this.bridgeSlotsById.clear()
+    this.bigBranch = null
+    this.nest = null
+    this.checkpoint = null
+    this.pond = null
+    this.saveButtons = []
+    this.dynamicEntities = []
   }
 
   /**
@@ -2047,6 +2413,7 @@ export class GameScene extends Scene {
           if (this.activePlayer instanceof Worm) {
             this.worldContainer.removeChild(this.activePlayer.container)
             this.entities = this.entities.filter((e) => e !== this.activePlayer)
+            this.unindexEntity(this.activePlayer)
 
             // Y муравья фиксируем на линии травы (та же формула, что и в
             // onCreate/SaveButton), а не берём "как есть" от червяка: тот
@@ -2089,6 +2456,7 @@ export class GameScene extends Scene {
 
               this.worldContainer.removeChild(this.activePlayer.container)
               this.entities = this.entities.filter((e) => e !== this.activePlayer)
+              this.unindexEntity(this.activePlayer)
 
               this.levelIndex = targetLevel
               this.currentLevelXOffset += window.innerWidth
@@ -2097,6 +2465,7 @@ export class GameScene extends Scene {
               this.entities = this.entities.filter((entity) => {
                 if (entity.container.x < safeXBound) {
                   this.worldContainer.removeChild(entity.container)
+                  this.unindexEntity(entity)
                   return false
                 }
                 return true
@@ -2258,6 +2627,7 @@ export class GameScene extends Scene {
   public restartLevel(): void {
     this.worldContainer.removeChildren()
     this.entities = []
+    this.clearEntityIndices()
     // Контейнеры напарника уже уничтожены строкой выше (removeChildren) —
     // забываем и сами инстансы, иначе следующий syncNetwork() попытается
     // двигать сущности, которых больше нет в мире, вместо того чтобы
@@ -2298,7 +2668,7 @@ export class GameScene extends Scene {
 
     for (const state of remoteStates) {
       seenPlayerIds.add(state.playerId)
-      this.upsertRemoteEntity(state)
+      this.upsertRemoteEntity(state, deltaTime)
     }
 
     for (const [playerId, remote] of this.remoteEntities) {
@@ -2306,6 +2676,7 @@ export class GameScene extends Scene {
 
       this.worldContainer.removeChild(remote.entity.container)
       this.entities = this.entities.filter((e) => e !== remote.entity)
+      this.unindexEntity(remote.entity)
       this.remoteEntities.delete(playerId)
     }
 
@@ -2329,7 +2700,7 @@ export class GameScene extends Scene {
    * (isDead) исключаются — как и раньше для одиночного activePlayer. */
   private getAllPlayerEntities(): (Worm | Ant | Frog)[] {
     const result: (Worm | Ant | Frog)[] = []
-    if (this.activePlayer && this.entities.includes(this.activePlayer) && !this.activePlayer.isDead) {
+    if (this.activePlayer && this.dynamicEntities.includes(this.activePlayer) && !this.activePlayer.isDead) {
       result.push(this.activePlayer)
     }
     for (const remote of this.remoteEntities.values()) {
@@ -2345,7 +2716,7 @@ export class GameScene extends Scene {
    * же remoteEntities Map, что использует upsertRemoteEntity. */
   private getGuardTargets(): GuardTarget[] {
     const targets: GuardTarget[] = []
-    if (this.activePlayer && this.entities.includes(this.activePlayer) && !this.activePlayer.isDead) {
+    if (this.activePlayer && this.dynamicEntities.includes(this.activePlayer) && !this.activePlayer.isDead) {
       targets.push({ id: "local", x: this.activePlayer.container.x, y: this.activePlayer.container.y })
     }
     for (const [playerId, remote] of this.remoteEntities) {
@@ -2365,7 +2736,7 @@ export class GameScene extends Scene {
 
   /** Создаёт (при первом появлении), пересоздаёт (при смене формы — прошёл
    * метаморфозу у себя) и двигает сущность одного напарника. */
-  private upsertRemoteEntity(state: PlayerState): void {
+  private upsertRemoteEntity(state: PlayerState, deltaTime: number): void {
     let remote = this.remoteEntities.get(state.playerId)
 
     if (!remote) {
@@ -2388,6 +2759,7 @@ export class GameScene extends Scene {
       // нашим собственным игроком.
       this.worldContainer.removeChild(remote.entity.container)
       this.entities = this.entities.filter((e) => e !== remote!.entity)
+      this.unindexEntity(remote.entity)
 
       const nextEntity = this.createRemotePlayerEntity(state.form, state.x, state.y)
       nextEntity.applyRemoteLook(this.getRemoteRole(state.playerId))
@@ -2399,10 +2771,10 @@ export class GameScene extends Scene {
     if (remote.entity instanceof Ant) {
       // Муравей ходит только по одной линии травы — Y не шарится (см.
       // Ant.setRemotePosition).
-      remote.entity.setRemotePosition(state.x)
+      remote.entity.setRemotePosition(state.x, deltaTime)
     } else {
       // Worm/Frog двигаются по обеим осям.
-      remote.entity.setRemotePosition(state.x, state.y)
+      remote.entity.setRemotePosition(state.x, state.y, deltaTime)
     }
   }
 
@@ -2608,6 +2980,7 @@ export class GameScene extends Scene {
                 this.totalStars--
               }
               this.worldContainer.removeChild(entity.container)
+              this.unindexEntity(entity)
               return false
             }
             return true
@@ -2657,6 +3030,7 @@ export class GameScene extends Scene {
           this.entities = this.entities.filter((entity) => {
             if (entity !== this.activePlayer && entity.container.x < safeXBound) {
               this.worldContainer.removeChild(entity.container)
+              this.unindexEntity(entity)
               return false
             }
             return true
@@ -2777,8 +3151,7 @@ export class GameScene extends Scene {
       }
     }
 
-    const walls = this.entities.filter((e): e is Wall => e instanceof Wall)
-    const stars = this.entities.filter((e): e is Star => e instanceof Star)
+    const stars = this.stars
 
     let prevPlayerX = 0
     let prevPlayerY = 0
@@ -2789,18 +3162,16 @@ export class GameScene extends Scene {
     // столкновении) ДАЖЕ на паузе — держим их актуальными всегда, а не
     // только внутри paused-гейта, иначе, если что-то заденет
     // приостановленного игрока, его откатило бы в (0, 0) вместо текущей
-    // (просто неподвижной) позиции.
-    if (this.activePlayer && this.entities.includes(this.activePlayer)) {
+    // (просто неподвижной) позиции. dynamicEntities вместо entities — тот же
+    // список "жив ли ещё этот конкретный игрок", только маленький (враги/
+    // страж/игроки), а не все стены уровня (см. indexEntity/unindexEntity).
+    if (this.activePlayer && this.dynamicEntities.includes(this.activePlayer)) {
       prevPlayerX = this.activePlayer.container.x
       prevPlayerY = this.activePlayer.container.y
     }
 
-    if (!this.paused && this.activePlayer && this.entities.includes(this.activePlayer)) {
-      // По id, а не просто по счётчику — в co-op нужно знать, КАКИЕ именно
-      // звёзды пропали, чтобы запросить их зачёт у сервера (см. ниже).
-      const starsVisibleBefore = new Map(stars.map((star) => [star.id, star.container.visible]))
-
-      this.activePlayer.update(deltaTime, walls, stars)
+    if (!this.paused && this.activePlayer && this.dynamicEntities.includes(this.activePlayer)) {
+      this.activePlayer.update(deltaTime, this.wallLookup, stars)
 
       if (this.activePlayer instanceof Ant) {
         // Борта текущего экрана — считаем относительно currentLevelXOffset,
@@ -2821,7 +3192,7 @@ export class GameScene extends Scene {
         if (!this.activePlayer.isFlailing) {
           const ant = this.activePlayer
 
-          const checkpoint = this.entities.find((e): e is Checkpoint => e instanceof Checkpoint)
+          const checkpoint = this.checkpoint
           if (checkpoint && ant.isColliding(checkpoint)) {
             this.lastCheckpointX = ant.container.x
             this.lastCheckpointY = ant.container.y
@@ -2829,8 +3200,7 @@ export class GameScene extends Scene {
 
           // Подбор мелкого материала (лист/ветка) — только если ещё ничего не несём.
           if (!this.carriedMaterialKind) {
-            const materials = this.entities.filter((e): e is Material => e instanceof Material)
-            for (const material of materials) {
+            for (const material of this.materials) {
               if (material.container.visible && ant.isColliding(material)) {
                 this.tryGrabMaterial(material)
                 break
@@ -2845,10 +3215,8 @@ export class GameScene extends Scene {
           // на пороге собственной постройки (см. POND_DROWN_GRACE — в co-op
           // установка ещё и не применяется мгновенно, идёт через сервер).
           if (this.carriedMaterialId && this.carriedMaterialKind) {
-            const carriedMaterial = this.entities.find((e): e is Material => e instanceof Material && e.id === this.carriedMaterialId)
-            const openSlot = this.entities
-              .filter((e): e is BridgeSlot => e instanceof BridgeSlot)
-              .find((slot) => !slot.isInstalled && slot.accepts === "material" && ant.isColliding(slot))
+            const carriedMaterial = this.materialsById.get(this.carriedMaterialId)
+            const openSlot = this.bridgeSlots.find((slot) => !slot.isInstalled && slot.accepts === "material" && ant.isColliding(slot))
 
             if (carriedMaterial && openSlot) {
               this.tryInstallMaterial(carriedMaterial, openSlot)
@@ -2856,7 +3224,7 @@ export class GameScene extends Scene {
           }
 
           let justDrowned = false
-          const pond = this.entities.find((e): e is Pond => e instanceof Pond)
+          const pond = this.pond
           if (pond && ant.isColliding(pond)) {
             // isColliding (не одна точка container.x) — тем же способом, что
             // и столкновение с самим прудом выше: у Entity/Ant рамка
@@ -2865,8 +3233,7 @@ export class GameScene extends Scene {
             // тем же способом, иначе муравей мог тонуть, едва коснувшись
             // края пруда хитбоксом, ещё визуально стоя на предыдущем
             // (уже наведённом) слоте или даже на берегу перед первым слотом.
-            const slots = this.entities.filter((e): e is BridgeSlot => e instanceof BridgeSlot)
-            const isOnBridge = slots.some((slot) => slot.isInstalled && ant.isColliding(slot))
+            const isOnBridge = this.bridgeSlots.some((slot) => slot.isInstalled && ant.isColliding(slot))
 
             if (isOnBridge) {
               this.pondUnsafeTimer = 0
@@ -2890,7 +3257,7 @@ export class GameScene extends Scene {
             // несколько заходов) или 2 муравья (нормальная скорость) разом.
             // Считает только тот, кто её реально симулирует (хост/single
             // player), см. BigBranch — гость лишь отрисовывает setRemoteState.
-            const bigBranch = this.entities.find((e): e is BigBranch => e instanceof BigBranch)
+            const bigBranch = this.bigBranch
             const simulatesBigBranch = this.network.getSnapshot().mode !== "coop" || this.network.isHost()
 
             if (bigBranch && !bigBranch.installed && simulatesBigBranch) {
@@ -2910,7 +3277,7 @@ export class GameScene extends Scene {
 
               if (bigBranch.progress >= 1) {
                 bigBranch.markInstalled()
-                const finalSlot = this.entities.filter((e): e is BridgeSlot => e instanceof BridgeSlot).find((slot) => slot.accepts === "bigBranch")
+                const finalSlot = this.bridgeSlots.find((slot) => slot.accepts === "bigBranch")
                 if (finalSlot && !finalSlot.isInstalled) finalSlot.install("bigBranch", "bigBranch")
               }
 
@@ -2929,8 +3296,7 @@ export class GameScene extends Scene {
         // Кнопка сохранения — единственный способ сохранить прогресс.
         // Дошёл до неё муравьём — записываем текущий уровень в
         // localStorage (один раз, дальше кнопка просто гаснет зелёным).
-        const saveButtons = this.entities.filter((e): e is SaveButton => e instanceof SaveButton)
-        for (const button of saveButtons) {
+        for (const button of this.saveButtons) {
           if (!button.isPressed && this.activePlayer.isColliding(button)) {
             button.press()
             this.saveLevelProgress(this.levelIndex)
@@ -2959,27 +3325,25 @@ export class GameScene extends Scene {
         this.worldContainer.position.set(window.innerWidth / 2, window.innerHeight / 2)
       }
 
-      const newlyHiddenStars = stars.filter((star) => starsVisibleBefore.get(star.id) && !star.container.visible)
-
-      if (newlyHiddenStars.length > 0) {
-        if (isCoopShared) {
-          // Не считаем локально — общий счёт придёт широковещательно от
-          // сервера (см. processSharedLevelEvents/starCollected), тем самым
-          // и не даём двум игрокам одновременно подобрать одну звезду
-          // (сервер проверяет уникальность starId, см. LevelStateService).
-          for (const star of newlyHiddenStars) {
-            this.network.requestStarPickup(this.levelIndex, star.id)
-          }
-        } else {
-          this.collectedStars += newlyHiddenStars.length
-          this.updateHud()
+      // Звёзды — единая точка подбора tryPickupStar() (см. выше), сама
+      // решает solo/co-op и не даёт слать повторный запрос, пока предыдущий
+      // ещё не подтверждён (см. pendingStarPickups). В отличие от пузырьков/
+      // факела ниже (обычное AABB-пересечение по ТЕКУЩЕЙ позиции) тут
+      // проверяем весь пройденный за кадр отрезок (prevPlayerX/Y -> текущая
+      // позиция), а не только конечную точку — звезда маленькая (STAR_SIZE),
+      // и при просадке кадра (лаг-спайк/большой deltaTime, тот же
+      // прыгающий боост скорости) игрок вполне может целиком перепрыгнуть
+      // её хитбокс за один шаг, ни разу не пересекшись с ним в конечной
+      // позиции — тогда её никак не подобрать.
+      for (const star of stars) {
+        if (star.container.visible && this.isPlayerPathNearStar(prevPlayerX, prevPlayerY, star)) {
+          this.tryPickupStar(star)
         }
       }
 
       // Пузырьки света не встроены в логику Worm.update — подбираем их прямо
       // тут через обычное AABB-пересечение и сразу расширяем радиус тумана.
-      const bubbles = this.entities.filter((e): e is Bubble => e instanceof Bubble)
-      for (const bubble of bubbles) {
+      for (const bubble of this.bubbles) {
         if (bubble.container.visible && this.activePlayer.isColliding(bubble)) {
           if (isCoopShared) {
             // Не гасим локально и не трогаем lightRadius тут же — ждём
@@ -2998,8 +3362,7 @@ export class GameScene extends Scene {
 
       // Пузырьки скорости — тот же принцип, только временный буст вместо
       // постоянной добавки к радиусу (см. GameConfig.SPEED_BOOST_DURATION).
-      const speedBubbles = this.entities.filter((e): e is SpeedBubble => e instanceof SpeedBubble)
-      for (const speedBubble of speedBubbles) {
+      for (const speedBubble of this.speedBubbles) {
         if (speedBubble.container.visible && this.activePlayer.isColliding(speedBubble)) {
           if (isCoopShared) {
             this.network.requestBoostActivate(this.levelIndex, speedBubble.id, "speed")
@@ -3013,8 +3376,7 @@ export class GameScene extends Scene {
 
       // Факел-выключатель — так же, отдельным AABB-пересечением: подобрал —
       // на минуту туман войны полностью выключается.
-      const revealSwitches = this.entities.filter((e): e is RevealSwitch => e instanceof RevealSwitch)
-      for (const revealSwitch of revealSwitches) {
+      for (const revealSwitch of this.revealSwitches) {
         if (revealSwitch.container.visible && this.activePlayer.isColliding(revealSwitch)) {
           if (isCoopShared) {
             this.network.requestLightActivate(this.levelIndex, revealSwitch.id)
@@ -3040,12 +3402,16 @@ export class GameScene extends Scene {
     // хватает её снова и топчется на месте вместо того, чтобы искать
     // следующую. Игроку они всё равно видны и доступны — он получает
     // полный список stars, только враги — урезанный.
-    const nestForFilter = this.entities.find((e): e is Nest => e instanceof Nest)
+    const nestForFilter = this.nest
     const stealableStars = nestForFilter
       ? stars.filter((star) => Math.hypot(star.container.x - nestForFilter.container.x, star.container.y - nestForFilter.container.y) > NEST_STORAGE_RADIUS)
       : stars
 
-    this.entities.forEach((entity) => {
+    // dynamicEntities — уже НЕ весь this.entities, а только то, что вообще
+    // может иметь непустой update() (враги/страж/игроки, см. indexEntity) —
+    // статичные стены/звёзды/пузырьки/слоты и т.п. сюда даже не попадают, их
+    // update() всё равно всегда пуст (см. соответствующие классы).
+    for (const entity of this.dynamicEntities) {
       if (entity !== this.activePlayer && !(entity instanceof GuardWorm) && !this.isRemoteEntity(entity)) {
         // Передаём стены и звёзды всем сущностям — они не обязаны их
         // использовать (Wall/Star/Bubble/Nest их игнорируют), но вражеским
@@ -3058,9 +3424,9 @@ export class GameScene extends Scene {
         // (например, найдёт "стену" прямо под ним в точке (0,0) до первого
         // сетевого снапшота и убьёт — двигаем его исключительно через
         // setRemotePosition в syncNetwork).
-        entity.update(deltaTime, walls, stealableStars)
+        entity.update(deltaTime, this.wallLookup, stealableStars)
       }
-    })
+    }
 
     // Страж реагирует на ЛЮБОГО игрока комнаты (см. GuardWorm.tick — ближайший
     // в зоне агрессии, с гистерезисом переключения цели), вражеских воров ему
@@ -3072,12 +3438,12 @@ export class GameScene extends Scene {
     // для НАШЕГО собственного игрока — каждый клиент сам себе авторитет по
     // смерти своего активного игрока (как и от камня/руки стража повсюду
     // ниже); напарник ровно так же убьёт себя сам на своём клиенте.
-    const guards = this.entities.filter((e): e is GuardWorm => e instanceof GuardWorm)
-    const playerForGuard = this.activePlayer && this.entities.includes(this.activePlayer) ? this.activePlayer : undefined
+    const guards = this.guards
+    const playerForGuard = this.activePlayer && this.dynamicEntities.includes(this.activePlayer) ? this.activePlayer : undefined
     const guardTargets = this.getGuardTargets()
 
     for (const guard of guards) {
-      guard.tick(deltaTime, walls, guardTargets)
+      guard.tick(deltaTime, this.wallLookup, guardTargets)
     }
 
     if (playerForGuard) {
@@ -3096,7 +3462,7 @@ export class GameScene extends Scene {
     // её видно (счётчик над домиком) и можно забрать обратно, как обычную
     // звезду. Столкновение с игроком по дороге заставляет вора выронить
     // украденное прямо на месте.
-    const enemies = this.entities.filter((e): e is EnemyWorm => e instanceof EnemyWorm)
+    const enemies = this.enemies
     const nest = nestForFilter
 
     // Co-op: только хост комнаты реально симулирует кражу/доставку звёзд —
@@ -3153,27 +3519,41 @@ export class GameScene extends Scene {
       nest.setStoredCount(storedCount)
     }
 
-    if (isCoopShared) {
-      // Общий дифф копания — сканируем ПОСЛЕ всех апдейтов этого кадра
-      // (игрок уже прогрыз своё выше, хост-враги — в entities.forEach чуть
-      // раньше в этом же кадре), чтобы не упустить ни один удар.
-      for (const wall of walls) {
-        if (!wall.justHit || !wall.cellKey) continue
+    // Стены, ударенные в этом кадре (см. Wall.onDirty/dirtyWalls) —
+    // вычерпываем и сбрасываем justHit ВСЕГДА (не только в co-op), иначе в
+    // single player это множество только бы росло весь забег и никогда не
+    // освобождало бы ссылки на давно прогрызенные/оставленные позади стены.
+    // Сканируем ПОСЛЕ всех апдейтов этого кадра (игрок уже прогрыз своё выше,
+    // хост-враги — в цикле по dynamicEntities чуть раньше в этом же кадре),
+    // чтобы не упустить ни один удар.
+    if (this.dirtyWalls.size > 0) {
+      for (const wall of this.dirtyWalls) {
         wall.justHit = false
-        const hits = wall.maxHitPoints - wall.hitPoints
-        this.network.reportWallHit(this.levelIndex, wall.cellKey, hits, wall.hitPoints <= 0)
+        if (isCoopShared && wall.cellKey) {
+          const hits = wall.maxHitPoints - wall.hitPoints
+          this.network.reportWallHit(this.levelIndex, wall.cellKey, hits, wall.hitPoints <= 0)
+        }
       }
+      this.dirtyWalls.clear()
+    }
 
+    if (isCoopShared && this.network.isHost()) {
       // Только хост реально шлёт это (см. GameNetworkStore.sendEnemyState) —
       // сервер лишь хранит последнее известное состояние и ретранслирует
       // партнёру, сама AI-симуляция остаётся полностью локальной у хоста.
-      if (this.network.isHost()) {
-        const netStates: EnemyNetState[] = [
-          ...guards.map((g) => g.toNetState()),
-          ...enemies.map((e) => e.toNetState(e.carriedStar?.id ?? null)),
-        ]
-        this.network.sendEnemyState(this.levelIndex, netStates)
-      }
+      const netStates: EnemyNetState[] = [
+        ...guards.map((g) => g.toNetState()),
+        ...enemies.map((e) => e.toNetState(e.carriedStar?.id ?? null)),
+      ]
+      this.network.sendEnemyState(this.levelIndex, netStates)
     }
   }
+}
+
+/** Удаляет первое вхождение item из array, если оно там есть — вынесено из
+ * класса, т.к. используется только внутри unindexEntity (см. выше) для
+ * нескольких разнотипных кэш-массивов подряд. */
+function removeFromArray<T>(array: T[], item: T): void {
+  const index = array.indexOf(item)
+  if (index !== -1) array.splice(index, 1)
 }
