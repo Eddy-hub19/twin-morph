@@ -253,10 +253,16 @@ export class GameScene extends Scene {
    * pendingWaterSegment выше). */
   private pendingWaterPassageEnter = false
   /** RoomLevelState уровня 4, уже присланный сервером вместе с
-   * waterPassageEntered (co-op) — handleMetamorphosis (TRANSFORM, Frog ->
-   * Worm) применяет его вместо локальной генерации, чтобы оба игрока
-   * получили один и тот же seed/размер уровня 4. null в single player —
-   * там уровень 4 просто генерируется на месте, без сервера. */
+   * waterPassageEntered (co-op) — handleMetamorphosis (TRANSFORM) применяет
+   * его вместо локальной генерации, чтобы оба игрока получили один и тот же
+   * seed/размер уровня 4. null в single player — там уровень 4 просто
+   * генерируется на месте, без сервера.
+   *
+   * Также служит сигналом форсированного перехода: если он выставлен, а
+   * activePlayer при этом НЕ жаба (см. update() — отстающий партнёр, ещё не
+   * доплывший до уровня 3 сам), TRANSFORM всё равно ведёт его сразу на
+   * уровень 4, какой бы ни была его текущая форма — комната уже открыла
+   * проход без него, ждать, пока он сам доберётся до жабьей фазы, нельзя. */
   private pendingLevel4State: RoomLevelState | null = null
   /** Тот же принцип, что и pendingWaterSegment/pendingWaterPassageEnter —
    * держит TRANSFORM (Frog -> Worm) от повторного запуска new Worm()/
@@ -2044,7 +2050,106 @@ export class GameScene extends Scene {
         this.activePlayer.container.scale.set(Math.sin(this.metaTimer * 12) * 0.15 + 1)
 
         if (this.metaTimer >= TRANSFORM_DURATION && !this.pendingWaterSegment) {
-          if (this.activePlayer instanceof Worm) {
+          if (this.pendingWormInit) {
+            // Уже конвертируемся в червя ниже (см. следующую ветку) —
+            // асинхронная загрузка спрайта (Worm.init()) ещё не завершилась,
+            // ничего больше тут не делаем и ждём следующего кадра. Без этой
+            // отдельной проверки, пока pendingWormInit=true, activePlayer
+            // (это может быть ЛЮБАЯ форма — см. форсированный переход ниже)
+            // попал бы в чужую ветку Worm/Ant ниже и запустил бы ещё одну,
+            // лишнюю метаморфозу поверх уже идущей.
+          } else if (this.activePlayer instanceof Frog || this.pendingLevel4State !== null) {
+            // Frog -> Worm (см. ветку ниже, вынесенную первой в очереди
+            // проверок): жаба у открытого (ключ найден) подводного прохода в
+            // самом низу уровня 3 превращается обратно в червя — уровень 4
+            // (снова копание) генерируется тут же. В co-op — из
+            // pendingLevel4State, уже присланного сервером вместе с
+            // waterPassageEntered (см. update()); в single player — просто
+            // локально, тем же способом, что и старт уровня 0.
+            //
+            // pendingLevel4State тут же может оказаться выставлен и для
+            // игрока, который сам ещё НЕ жаба (ещё копает 0/1 или ещё муравей
+            // на 2) — комната уже открыла проход без него (см. update(),
+            // безусловный drainWaterPassageEntered), и его нужно так же
+            // утянуть на уровень 4 сразу, какой бы ни была его текущая форма
+            // — поэтому проверка тут стоит ПЕРЕД Worm/Ant ниже, а не после.
+            //
+            // pendingWormInit держит TRANSFORM тут же (без повторного захода
+            // в эту ветку каждый кадр) до тех пор, пока не загрузится спрайт
+            // нового червя (Worm.init() асинхронный, в отличие от Ant/Frog) —
+            // тот же принцип, что и pendingWaterSegment выше.
+            this.pendingWormInit = true
+
+            const level4State = this.pendingLevel4State
+            this.pendingLevel4State = null
+
+            const buildWorm = () => {
+              const nextYOffset = this.currentLevelYOffset + this.waterLevelHeight + this.digLevelHeight()
+              const nextXOffset = this.currentLevelXOffset + window.innerWidth
+
+              const worm = new Worm(this.input)
+              worm.init().then(() => {
+                this.pendingWormInit = false
+                if (this.destroyed) return
+
+                this.worldContainer.removeChild(this.activePlayer.container)
+                this.entities = this.entities.filter((e) => e !== this.activePlayer)
+
+                this.currentLevelYOffset = nextYOffset
+                this.currentLevelXOffset = nextXOffset
+
+                const safeXBound = this.currentLevelXOffset - window.innerWidth * 2
+                this.entities = this.entities.filter((entity) => {
+                  if (entity.container.x < safeXBound) {
+                    this.worldContainer.removeChild(entity.container)
+                    return false
+                  }
+                  return true
+                })
+
+                this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
+
+                worm.container.x = this.currentLevelXOffset + this.roomLevelWidth / 2
+                worm.container.y = this.currentLevelYOffset + 60
+                this.activePlayer = worm
+
+                this.addEntity(worm)
+                this.worldContainer.addChild(worm.container)
+
+                console.log("Метаморфоз завершён! Жаба снова стала червяком.")
+                this.metaState = MetaState.ZOOM_OUT
+              })
+            }
+
+            if (level4State) {
+              if (this.activePlayer instanceof Frog) {
+                this.prepareRoomLevel(level4State, this.network.getEpoch())
+                buildWorm()
+              } else {
+                // Отстающий партнёр ещё не заводил собственный водный сегмент
+                // (this.waterLevelHeight === 0 по умолчанию) — без канонической
+                // (общей для комнаты) высоты сегмента смещение уровня 4 по Y
+                // разъедется с тем, что уже использовал ушедший вперёд партнёр
+                // (см. prepareWaterSegment/ensureWaterSegment). Запрашиваем те
+                // же самые канонические width/height/seed уровня 3 (он уже
+                // закреплён сервером — это НЕ создаёт для нас сам уровень 3,
+                // только читает уже существующие размеры) — и только ПОСЛЕ
+                // этого вызываем prepareRoomLevel, иначе prepareWaterSegment
+                // своим createRng(segment.seed) затёр бы rng уровня 4, который
+                // выставит prepareRoomLevel (см. её же createRng(level.seed)).
+                this.prepareWaterSegment(3).then(() => {
+                  this.prepareRoomLevel(level4State, this.network.getEpoch())
+                  buildWorm()
+                })
+              }
+            } else {
+              this.rng = Math.random
+              this.roomLevelWidth = this.digLevelWidth()
+              this.roomLevelHeight = this.digLevelHeight()
+              this.levelIndex = 4
+              buildWorm()
+            }
+          } else if (this.activePlayer instanceof Worm) {
             this.worldContainer.removeChild(this.activePlayer.container)
             this.entities = this.entities.filter((e) => e !== this.activePlayer)
 
@@ -2119,71 +2224,6 @@ export class GameScene extends Scene {
               this.worldContainer.addChild(frog.container)
 
               console.log("Метаморфоз завершён! Рождена Жаба.")
-              this.metaState = MetaState.ZOOM_OUT
-            })
-          } else if (this.activePlayer instanceof Frog && !this.pendingWormInit) {
-            // Frog -> Worm: жаба у открытого (ключ найден) подводного прохода
-            // в самом низу уровня 3 превращается обратно в червя — уровень 4
-            // (снова копание) генерируется тут же: в co-op — из
-            // pendingLevel4State, уже присланного сервером вместе с
-            // waterPassageEntered (см. триггер этого перехода в update()),
-            // чтобы оба игрока получили один и тот же seed/размер; в single
-            // player — просто локально, тем же способом, что и старт уровня 0.
-            //
-            // pendingWormInit держит TRANSFORM тут же (без повторного захода в
-            // эту ветку каждый кадр) до тех пор, пока не загрузится спрайт
-            // нового червяка (Worm.init() асинхронный, в отличие от Ant/Frog) —
-            // тот же принцип, что и pendingWaterSegment выше.
-            this.pendingWormInit = true
-
-            const level4State = this.pendingLevel4State
-            this.pendingLevel4State = null
-
-            if (level4State) {
-              this.prepareRoomLevel(level4State, this.network.getEpoch())
-            } else {
-              this.rng = Math.random
-              this.roomLevelWidth = this.digLevelWidth()
-              this.roomLevelHeight = this.digLevelHeight()
-              this.levelIndex = 4
-            }
-
-            // Новый, заведомо свободный от всего остального (диг-фазы,
-            // поверхности, самого водоёма) блок координат — ниже уровня 3 по
-            // Y (тот уже целиком известен, см. waterLevelHeight), дальше по X.
-            const nextYOffset = this.currentLevelYOffset + this.waterLevelHeight + this.digLevelHeight()
-            const nextXOffset = this.currentLevelXOffset + window.innerWidth
-
-            const worm = new Worm(this.input)
-            worm.init().then(() => {
-              this.pendingWormInit = false
-              if (this.destroyed) return
-
-              this.worldContainer.removeChild(this.activePlayer.container)
-              this.entities = this.entities.filter((e) => e !== this.activePlayer)
-
-              this.currentLevelYOffset = nextYOffset
-              this.currentLevelXOffset = nextXOffset
-
-              const safeXBound = this.currentLevelXOffset - window.innerWidth * 2
-              this.entities = this.entities.filter((entity) => {
-                if (entity.container.x < safeXBound) {
-                  this.worldContainer.removeChild(entity.container)
-                  return false
-                }
-                return true
-              })
-
-              this.generateNextLevel(this.currentLevelXOffset, this.currentLevelYOffset, this.levelIndex)
-
-              worm.container.x = this.currentLevelXOffset + this.roomLevelWidth / 2
-              worm.container.y = this.currentLevelYOffset + 60
-              this.activePlayer = worm
-
-              this.addEntity(worm)
-              this.worldContainer.addChild(worm.container)
-
-              console.log("Метаморфоз завершён! Жаба снова стала червяком.")
               this.metaState = MetaState.ZOOM_OUT
             })
           }
@@ -2511,6 +2551,28 @@ export class GameScene extends Scene {
         return
       }
 
+      // Проход уровня 3->4 — та же "разом на всю комнату" логика, что и
+      // levelAdvanced выше, но раньше проверялась только глубоко внутри ветки
+      // "activePlayer instanceof Frog && levelIndex === 3" (см. ниже). Из-за
+      // этого отстающий партнёр (ещё копает 0/1 или ещё муравей на 2 — сам
+      // ещё не доплыл до жабьей фазы) никогда не доходил до той проверки и
+      // повисал с непрочитанным событием, пока сам когда-нибудь не станет
+      // жабой на уровне 3 — тогда его тут же дёргало на уровень 4 без
+      // предупреждения. Дренируем это же событие тут же, безусловно (не
+      // дожидаясь, пока локальный игрок сам окажется жабой), чтобы отстающего
+      // тоже сразу утянуло на уровень 4 — тем же принципом, что и
+      // levelAdvanced выше. Не трогаем, если уже идёт другая метаморфоза
+      // (metaState !== NONE) — событие остаётся в очереди на следующий кадр.
+      if (this.metaState === MetaState.NONE && this.levelIndex < 4) {
+        const passageEntered = this.network.drainWaterPassageEntered()
+        if (passageEntered) {
+          this.pendingLevel4State = passageEntered.levelState
+          this.metaState = MetaState.ZOOM_IN
+          this.metaTimer = 0
+          return
+        }
+      }
+
       if (this.levelIndex <= 2) {
         this.processSharedLevelEvents()
       }
@@ -2705,13 +2767,9 @@ export class GameScene extends Scene {
             if (update.keyFound) this.keyFound = true
           }
 
-          const advanced = this.network.drainWaterPassageEntered()
-          if (advanced) {
-            this.pendingLevel4State = advanced.levelState
-            this.metaState = MetaState.ZOOM_IN
-            this.metaTimer = 0
-            return
-          }
+          // waterPassageEntered теперь дренируется безусловно в самом начале
+          // update() (см. выше) — так отстающий партнёр (ещё не жаба на
+          // уровне 3) тоже получает этот переход, а не повисает с ним.
         } else {
           const lilyPads = this.entities.filter((e): e is LilyPad => e instanceof LilyPad)
           for (const pad of lilyPads) {
